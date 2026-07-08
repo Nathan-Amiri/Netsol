@@ -285,10 +285,11 @@ app.Map("/", async context =>
     }
 
     using var socket = await context.WebSockets.AcceptWebSocketAsync();
-    string playerId = "p" + Interlocked.Increment(ref nextPlayerNum);
+    int playerNum = Interlocked.Increment(ref nextPlayerNum);
+    string playerId = playerNum.ToString();
     clients[playerId] = socket;
     Console.WriteLine($"[RELAY] {playerId} connected. Total clients: {clients.Count}");
-    await SendTo(socket, new { type = "assigned", id = playerId });
+    await SendTo(socket, new { type = "assigned", id = playerNum }); // sent as a real number, not a quoted string — this is what makes LocalPlayerId a genuine int client-side
 
     var buffer = new byte[8192];
     try
