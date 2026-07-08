@@ -37,38 +37,9 @@ var overlapState = new ConcurrentDictionary<string, bool>();
 var nextPlayerNum = 0;
 
 // ─── OBJECT MODEL ───────────────────────────────────────────────────────────
-
-class TrackedObject
-{
-    public string Id = "";
-    public string OwnerId = "";
-    public bool IsPredicted;
-
-    // Synced fields — meaningful when IsPredicted is false
-    public double X, Y, Vx, Vy;
-
-    // Predicted fields — meaningful when IsPredicted is true. Position is
-    // never stored directly; it's computed fresh from these every time
-    // anyone asks, using elapsed time since FireTimeMs.
-    public double StartX, StartY, StartVx, StartVy, Gravity;
-    public long FireTimeMs;
-
-    // Hitbox — Shape is null until RegisterHitbox has been called for this
-    // object, meaning it's excluded from hit detection until opted in.
-    public string? Shape; // "rect" or "ellipse"
-    public double Width, Height;
-    public int Layer;
-    public HashSet<int> TriggeredByLayers = new();
-
-    public (double x, double y) PositionAt(long nowMs)
-    {
-        if (!IsPredicted) return (X, Y);
-        double t = (nowMs - FireTimeMs) / 1000.0;
-        double x = StartX + StartVx * t;
-        double y = StartY + StartVy * t + 0.5 * Gravity * t * t;
-        return (x, y);
-    }
-}
+// (Declared at the end of the file — a top-level statements file requires
+// every plain executable statement to come before any class/struct
+// declaration, so TrackedObject has to live after app.Run(), not here.)
 
 // ─── OVERLAP MATH ───────────────────────────────────────────────────────────
 // Rect-rect is exact (standard AABB test). Anything touching an ellipse is
@@ -352,3 +323,42 @@ _ = Task.Run(HitDetectionLoop);
 
 Console.WriteLine("Relay starting...");
 app.Run();
+
+// ─── OBJECT MODEL ───────────────────────────────────────────────────────────
+// Has to live down here — a top-level statements file requires every plain
+// executable statement to come before any class/struct declaration, and
+// app.Run() above is the last statement. C# allows using a type before its
+// declaration within the same file, so everything earlier in the file that
+// references TrackedObject works fine regardless of where this sits.
+
+class TrackedObject
+{
+    public string Id = "";
+    public string OwnerId = "";
+    public bool IsPredicted;
+
+    // Synced fields — meaningful when IsPredicted is false
+    public double X, Y, Vx, Vy;
+
+    // Predicted fields — meaningful when IsPredicted is true. Position is
+    // never stored directly; it's computed fresh from these every time
+    // anyone asks, using elapsed time since FireTimeMs.
+    public double StartX, StartY, StartVx, StartVy, Gravity;
+    public long FireTimeMs;
+
+    // Hitbox — Shape is null until RegisterHitbox has been called for this
+    // object, meaning it's excluded from hit detection until opted in.
+    public string? Shape; // "rect" or "ellipse"
+    public double Width, Height;
+    public int Layer;
+    public HashSet<int> TriggeredByLayers = new HashSet<int>();
+
+    public (double x, double y) PositionAt(long nowMs)
+    {
+        if (!IsPredicted) return (X, Y);
+        double t = (nowMs - FireTimeMs) / 1000.0;
+        double x = StartX + StartVx * t;
+        double y = StartY + StartVy * t + 0.5 * Gravity * t * t;
+        return (x, y);
+    }
+}
