@@ -316,6 +316,10 @@ app.Map("/", async context =>
             objects.TryRemove(id, out _);
             await BroadcastExcept(playerId, new { type = "delete", id, from = playerId });
         }
+        // Sent after the object cleanup above, so by the time a client
+        // learns a player left, anything that player owned has already
+        // been cleaned up on their end too.
+        await BroadcastExcept(playerId, new { type = "playerLeft", id = playerNum });
         Console.WriteLine($"[RELAY] {playerId} disconnected. Total clients: {clients.Count}");
     }
 });
