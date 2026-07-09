@@ -30,6 +30,7 @@ app.UseWebSockets();
 // ─── STATE ──────────────────────────────────────────────────────────────────
 
 var clients = new ConcurrentDictionary<string, WebSocket>();
+var lastSeen = new ConcurrentDictionary<string, DateTimeOffset>(); // playerId -> last time ANY message was received from them
 var objects = new ConcurrentDictionary<string, TrackedObject>();
 // Per-pair overlap state, so the enter/exit events only fire on a change,
 // never every tick while two things stay overlapped.
@@ -210,6 +211,16 @@ async Task HandleMessage(string senderId, string json)
                 break;
             }
 
+            case "pong":
+            {
+                // No-op — lastSeen was already updated generically before
+                // this switch ran, which is the only thing a pong is for.
+                // Handled explicitly here so it doesn't fall through to
+                // the default case and get broadcast to everyone else,
+                // who have no use for it.
+                break;
+            }
+
             default:
             {
                 // Generic passthrough — the "call a method on everyone" tool.
@@ -274,6 +285,79 @@ async Task HitDetectionLoop()
     }
 }
 
+// Removes a player and everything they own, and tells everyone else.
+// Idempotent — safe to call from two different places for the same player
+// (the normal disconnect path and the heartbeat timeout path both call
+// this), since clients.TryRemove only succeeds once; a second call for an
+// already-removed player is a no-op rather than a duplicate broadcast.
+async Task CleanupPlayer(string playerId, int playerNum)
+{
+    if (!clients.TryRemove(playerId, out _)) return;
+    lastSeen.TryRemove(playerId, out _);
+    var owned = objects.Values.Where(o => o.OwnerId == playerId).Select(o => o.Id).ToList();
+    foreach (var id in owned)
+    {
+        objects.TryRemove(id, out _);
+        await BroadcastExcept(playerId, new { type = "delete", id, from = playerId });
+    }
+    // Sent after the object cleanup above, so by the time a client learns
+    // a player left, anything that player owned has already been cleaned
+    // up on their end too.
+    await BroadcastExcept(playerId, new { type = "playerLeft", id = playerNum });
+    Console.WriteLine($"[RELAY] {playerId} disconnected. Total clients: {clients.Count}");
+}
+
+// ─── HEARTBEAT ──────────────────────────────────────────────────────────────
+// Detects a connection that died without any warning — a killed process, a
+// crash, a phone that got locked and had its network suspended, a cable
+// pulled — none of which give the client any chance to send a graceful
+// close. The relay pings everyone periodically; if a client goes quiet for
+// too long, the relay assumes they're gone and force-closes the connection
+// itself, running the exact same cleanup a normal disconnect would.
+
+const int HEARTBEAT_INTERVAL_MS = 10000; // ping everyone every 10s
+const int HEARTBEAT_TIMEOUT_MS = 25000;  // presumed dead after 25s of silence (2.5 missed beats — tolerates one slow/lost ping without a false positive)
+
+async Task HeartbeatLoop()
+{
+    while (true)
+    {
+        await Task.Delay(HEARTBEAT_INTERVAL_MS);
+        await BroadcastAll(new { type = "ping" });
+
+        var now = DateTimeOffset.UtcNow;
+        foreach (var id in clients.Keys)
+        {
+            // No lastSeen entry yet means they only just connected —
+            // not stale, nothing to do.
+            if (lastSeen.TryGetValue(id, out var seen) && (now - seen).TotalMilliseconds > HEARTBEAT_TIMEOUT_MS)
+            {
+                Console.WriteLine($"[RELAY] {id} timed out (no message in {HEARTBEAT_TIMEOUT_MS}ms) — forcing disconnect");
+
+                // Cleanup and notification happen here directly, immediately
+                // — not left to the connection handler's own catch/finally
+                // noticing eventually. That matters because Abort() below
+                // isn't guaranteed to unstick a pending read right away: if
+                // the underlying TCP connection is "half-open" (this
+                // player's side is gone but the OS hasn't noticed yet — a
+                // severed network path rather than a cleanly closed one),
+                // a documented .NET issue means the stuck read can persist
+                // for minutes even after Abort() runs. Calling CleanupPlayer
+                // directly means the 25-second timeout is a real bound
+                // regardless of that. CleanupPlayer is safe to call here
+                // even though the connection handler's own finally block
+                // will *also* eventually call it once its read does
+                // unstick — the second call is a no-op, not a duplicate.
+                if (clients.TryGetValue(id, out var deadSocket))
+                {
+                    deadSocket.Abort(); // best-effort attempt to actually free the OS-level resources; not depended on for correctness
+                }
+                await CleanupPlayer(id, int.Parse(id));
+            }
+        }
+    }
+}
+
 // ─── CONNECTION HANDLING ────────────────────────────────────────────────────
 
 app.Map("/", async context =>
@@ -288,6 +372,7 @@ app.Map("/", async context =>
     int playerNum = Interlocked.Increment(ref nextPlayerNum);
     string playerId = playerNum.ToString();
     clients[playerId] = socket;
+    lastSeen[playerId] = DateTimeOffset.UtcNow;
     Console.WriteLine($"[RELAY] {playerId} connected. Total clients: {clients.Count}");
     await SendTo(socket, new { type = "assigned", id = playerNum }); // sent as a real number, not a quoted string — this is what makes LocalPlayerId a genuine int client-side
 
@@ -307,6 +392,7 @@ app.Map("/", async context =>
             var result = await socket.ReceiveAsync(buffer, CancellationToken.None);
             if (result.MessageType == WebSocketMessageType.Close) break;
             string json = Encoding.UTF8.GetString(buffer, 0, result.Count);
+            lastSeen[playerId] = DateTimeOffset.UtcNow;
             await HandleMessage(playerId, json);
         }
     }
@@ -317,22 +403,12 @@ app.Map("/", async context =>
     }
     finally
     {
-        clients.TryRemove(playerId, out _);
-        var owned = objects.Values.Where(o => o.OwnerId == playerId).Select(o => o.Id).ToList();
-        foreach (var id in owned)
-        {
-            objects.TryRemove(id, out _);
-            await BroadcastExcept(playerId, new { type = "delete", id, from = playerId });
-        }
-        // Sent after the object cleanup above, so by the time a client
-        // learns a player left, anything that player owned has already
-        // been cleaned up on their end too.
-        await BroadcastExcept(playerId, new { type = "playerLeft", id = playerNum });
-        Console.WriteLine($"[RELAY] {playerId} disconnected. Total clients: {clients.Count}");
+        await CleanupPlayer(playerId, playerNum);
     }
 });
 
 _ = Task.Run(HitDetectionLoop);
+_ = Task.Run(HeartbeatLoop);
 
 Console.WriteLine("Relay starting...");
 app.Run();
