@@ -291,6 +291,14 @@ app.Map("/", async context =>
     Console.WriteLine($"[RELAY] {playerId} connected. Total clients: {clients.Count}");
     await SendTo(socket, new { type = "assigned", id = playerNum }); // sent as a real number, not a quoted string — this is what makes LocalPlayerId a genuine int client-side
 
+    // Tell the newcomer who's already here (everyone else currently
+    // connected), and tell everyone else a newcomer just arrived. The
+    // relay already has this list for free — it's just never been sent
+    // anywhere until now.
+    var existingIds = clients.Keys.Where(k => k != playerId).Select(int.Parse).ToArray();
+    await SendTo(socket, new { type = "roster", ids = existingIds });
+    await BroadcastExcept(playerId, new { type = "playerJoined", id = playerNum });
+
     var buffer = new byte[8192];
     try
     {
