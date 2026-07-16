@@ -161,11 +161,31 @@ async Task HandleMessage(string senderId, string json)
                 obj.Y = root.GetProperty("y").GetDouble();
                 obj.Vx = root.TryGetProperty("vx", out var vxEl) ? vxEl.GetDouble() : 0;
                 obj.Vy = root.TryGetProperty("vy", out var vyEl) ? vyEl.GetDouble() : 0;
+                if (root.TryGetProperty("rot", out var rotEl)) obj.Rotation = rotEl.GetDouble();
                 await BroadcastExcept(senderId, RawPassthrough(senderId, root));
                 break;
             }
 
-            case "predict":
+            case "spawnSynced":
+            {
+                string id = root.GetProperty("id").GetString() ?? "";
+                if (id == "") return;
+                var obj = new TrackedObject
+                {
+                    Id = id,
+                    OwnerId = senderId,
+                    IsPredicted = false,
+                    TypeName = root.TryGetProperty("typeName", out var tnEl) ? (tnEl.GetString() ?? "") : "",
+                    X = root.GetProperty("x").GetDouble(),
+                    Y = root.GetProperty("y").GetDouble(),
+                };
+                if (root.TryGetProperty("rot", out var rotEl2)) obj.Rotation = rotEl2.GetDouble();
+                objects[id] = obj;
+                await BroadcastExcept(senderId, RawPassthrough(senderId, root));
+                break;
+            }
+
+            case "spawnPredicted":
             {
                 string id = root.GetProperty("id").GetString() ?? "";
                 if (id == "") return;
@@ -174,6 +194,7 @@ async Task HandleMessage(string senderId, string json)
                     Id = id,
                     OwnerId = senderId,
                     IsPredicted = true,
+                    TypeName = root.TryGetProperty("typeName", out var tnEl2) ? (tnEl2.GetString() ?? "") : "",
                     StartX = root.GetProperty("x").GetDouble(),
                     StartY = root.GetProperty("y").GetDouble(),
                     StartVx = root.GetProperty("vx").GetDouble(),
@@ -290,7 +311,7 @@ async Task HitDetectionLoop()
 // (the normal disconnect path and the heartbeat timeout path both call
 // this), since clients.TryRemove only succeeds once; a second call for an
 // already-removed player is a no-op rather than a duplicate broadcast.
-async Task CleanupPlayer(string playerId, int playerNum)
+async Task CleanupPlayer(string playerId)
 {
     if (!clients.TryRemove(playerId, out _)) return;
     lastSeen.TryRemove(playerId, out _);
@@ -300,10 +321,10 @@ async Task CleanupPlayer(string playerId, int playerNum)
         objects.TryRemove(id, out _);
         await BroadcastExcept(playerId, new { type = "delete", id, from = playerId });
     }
-    // Sent after the object cleanup above, so by the time a client learns
-    // a player left, anything that player owned has already been cleaned
-    // up on their end too.
-    await BroadcastExcept(playerId, new { type = "playerLeft", id = playerNum });
+    // No separate "player left" notification needed — a player's own
+    // avatar is just another object they own, already covered by the loop
+    // above. Whoever's listening for that object's delete message already
+    // knows a player is gone, without a second, player-specific event.
     Console.WriteLine($"[RELAY] {playerId} disconnected. Total clients: {clients.Count}");
 }
 
@@ -352,7 +373,7 @@ async Task HeartbeatLoop()
                 {
                     deadSocket.Abort(); // best-effort attempt to actually free the OS-level resources; not depended on for correctness
                 }
-                await CleanupPlayer(id, int.Parse(id));
+                await CleanupPlayer(id);
             }
         }
     }
@@ -376,13 +397,44 @@ app.Map("/", async context =>
     Console.WriteLine($"[RELAY] {playerId} connected. Total clients: {clients.Count}");
     await SendTo(socket, new { type = "assigned", id = playerNum }); // sent as a real number, not a quoted string — this is what makes LocalPlayerId a genuine int client-side
 
-    // Tell the newcomer who's already here (everyone else currently
-    // connected), and tell everyone else a newcomer just arrived. The
-    // relay already has this list for free — it's just never been sent
-    // anywhere until now.
-    var existingIds = clients.Keys.Where(k => k != playerId).Select(int.Parse).ToArray();
-    await SendTo(socket, new { type = "roster", ids = existingIds });
-    await BroadcastExcept(playerId, new { type = "playerJoined", id = playerNum });
+    // Catch the newcomer up on everything that already exists by replaying
+    // each object's spawn message directly — same shape as a live spawn,
+    // so the client needs no separate catch-up parsing, just the same
+    // spawnSynced/spawnPredicted handling it already needs anyway. This
+    // covers players too, once a player's own avatar is just a spawned
+    // object like anything else — no separate player-roster concept
+    // needed.
+    foreach (var obj in objects.Values)
+    {
+        if (obj.IsPredicted)
+        {
+            await SendTo(socket, new
+            {
+                type = "spawnPredicted", id = obj.Id, typeName = obj.TypeName,
+                x = obj.StartX, y = obj.StartY, vx = obj.StartVx, vy = obj.StartVy,
+                gravity = obj.Gravity, firedAt = obj.FireTimeMs, from = obj.OwnerId
+            });
+        }
+        else
+        {
+            if (obj.Rotation.HasValue)
+            {
+                await SendTo(socket, new
+                {
+                    type = "spawnSynced", id = obj.Id, typeName = obj.TypeName,
+                    rot = obj.Rotation.Value, x = obj.X, y = obj.Y, from = obj.OwnerId
+                });
+            }
+            else
+            {
+                await SendTo(socket, new
+                {
+                    type = "spawnSynced", id = obj.Id, typeName = obj.TypeName,
+                    x = obj.X, y = obj.Y, from = obj.OwnerId
+                });
+            }
+        }
+    }
 
     var buffer = new byte[8192];
     try
@@ -403,7 +455,7 @@ app.Map("/", async context =>
     }
     finally
     {
-        await CleanupPlayer(playerId, playerNum);
+        await CleanupPlayer(playerId);
     }
 });
 
@@ -425,9 +477,11 @@ class TrackedObject
     public string Id = "";
     public string OwnerId = "";
     public bool IsPredicted;
+    public string TypeName = ""; // which prefab a late joiner should instantiate for this object
 
     // Synced fields — meaningful when IsPredicted is false
     public double X, Y, Vx, Vy;
+    public double? Rotation; // null if this object doesn't sync rotation at all
 
     // Predicted fields — meaningful when IsPredicted is true. Position is
     // never stored directly; it's computed fresh from these every time
