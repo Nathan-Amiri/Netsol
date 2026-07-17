@@ -91,6 +91,45 @@ static bool Overlaps(TrackedObject a, (double x, double y) posA, TrackedObject b
     return (dnx * dnx + dny * dny) < 1.0;
 }
 
+// ─── SWEPT OVERLAP (PREDICTED OBJECTS ONLY) ─────────────────────────────────
+// A discrete, single-instant check can tunnel: a fast projectile can be on
+// one side of a target at tick N and past it at tick N+1, with no tick ever
+// landing inside the hitbox. Only applied when at least one side is a
+// predicted object, since a predicted object's position is a pure formula —
+// PositionAt can be evaluated at any real intermediate timestamp, giving a
+// true sample of the object's actual path rather than a guess. This is
+// deliberately NOT applied to synced-vs-synced pairs (two players): a synced
+// object's position is whatever the owning client last reported, so a large
+// tick-over-tick jump could be a genuine lag spike rather than real motion —
+// sweeping that segment risks registering a hit along a path the object
+// never actually traveled. Discrete per-tick checking has no such risk,
+// since it only ever asks "is it overlapping right now."
+const int SWEEP_SAMPLES = 8; // number of sub-steps checked between lastTickMs and now, in addition to the endpoints
+
+static bool OverlapsSwept(TrackedObject a, TrackedObject b, long lastTickMs, long now)
+{
+    // Explicit, not incidental: only a predicted object's position is
+    // resampled across the sweep — its formula gives a genuine
+    // intermediate position at each sampleMs. A synced object's position
+    // is fixed at whatever it last reported, so it's evaluated once at
+    // `now` and held constant for every sample, rather than calling
+    // PositionAt(sampleMs) on it and relying on that returning the same
+    // thing every time. If PositionAt for synced objects ever changes to
+    // interpolate, this still won't accidentally start sweeping a synced
+    // object's segment.
+    var fixedPosA = a.IsPredicted ? default : a.PositionAt(now);
+    var fixedPosB = b.IsPredicted ? default : b.PositionAt(now);
+
+    for (int s = 0; s <= SWEEP_SAMPLES; s++)
+    {
+        long sampleMs = lastTickMs + (now - lastTickMs) * s / SWEEP_SAMPLES;
+        var posA = a.IsPredicted ? a.PositionAt(sampleMs) : fixedPosA;
+        var posB = b.IsPredicted ? b.PositionAt(sampleMs) : fixedPosB;
+        if (Overlaps(a, posA, b, posB)) return true;
+    }
+    return false;
+}
+
 // ─── MESSAGING HELPERS ──────────────────────────────────────────────────────
 
 async Task SendTo(WebSocket socket, object message)
@@ -224,10 +263,41 @@ async Task HandleMessage(string senderId, string json)
                 break;
             }
 
+            case "unregisterHitbox":
+            {
+                // Sets Shape back to null, which is exactly what
+                // HitDetectionLoop's `o.Shape != null` filter checks — so
+                // this object stops taking part in hit detection without
+                // removing the TrackedObject itself (it may still be a
+                // perfectly live synced/predicted object, just opting out
+                // of hit detection specifically). Any pair state involving
+                // this id is stale now, so it's cleared too — otherwise a
+                // later re-registration under the same id could read a
+                // leftover "was overlapping" flag from before the gap and
+                // skip firing a real enter/exit.
+                string id = root.GetProperty("id").GetString() ?? "";
+                if (objects.TryGetValue(id, out var obj))
+                {
+                    obj.Shape = null;
+                }
+                foreach (var key in overlapState.Keys.Where(k => k.StartsWith(id + "|") || k.EndsWith("|" + id)).ToList())
+                {
+                    overlapState.TryRemove(key, out _);
+                }
+                // Relay-only bookkeeping — no broadcast needed, clients
+                // don't need to know about hitbox unregistration itself
+                // (they'll simply stop receiving overlap events for it).
+                break;
+            }
+
             case "delete":
             {
                 string id = root.GetProperty("id").GetString() ?? "";
                 objects.TryRemove(id, out _);
+                foreach (var key in overlapState.Keys.Where(k => k.StartsWith(id + "|") || k.EndsWith("|" + id)).ToList())
+                {
+                    overlapState.TryRemove(key, out _);
+                }
                 await BroadcastExcept(senderId, RawPassthrough(senderId, root));
                 break;
             }
@@ -277,6 +347,7 @@ const int TICK_MS = 33; // ~30Hz
 
 async Task HitDetectionLoop()
 {
+    long? lastTickMs = null; // null on the very first tick — nothing to sweep from yet, so that tick falls back to a discrete check
     while (true)
     {
         await Task.Delay(TICK_MS);
@@ -292,7 +363,15 @@ async Task HitDetectionLoop()
                 bool relevant = a.TriggeredByLayers.Contains(b.Layer) || b.TriggeredByLayers.Contains(a.Layer);
                 if (!relevant) continue;
 
-                bool overlapping = Overlaps(a, a.PositionAt(now), b, b.PositionAt(now));
+                // Swept only when at least one side is a predicted object
+                // (see the comment on OverlapsSwept for why synced objects
+                // are deliberately excluded) and only once a previous tick
+                // exists to sweep from.
+                bool useSwept = lastTickMs.HasValue && (a.IsPredicted || b.IsPredicted);
+                bool overlapping = useSwept
+                    ? OverlapsSwept(a, b, lastTickMs!.Value, now)
+                    : Overlaps(a, a.PositionAt(now), b, b.PositionAt(now));
+
                 string pairKey = string.CompareOrdinal(a.Id, b.Id) < 0 ? $"{a.Id}|{b.Id}" : $"{b.Id}|{a.Id}";
                 bool wasOverlapping = overlapState.TryGetValue(pairKey, out var prev) && prev;
 
@@ -303,6 +382,7 @@ async Task HitDetectionLoop()
                 }
             }
         }
+        lastTickMs = now;
     }
 }
 
