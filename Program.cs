@@ -100,8 +100,8 @@ static bool RectsOverlapSAT((double x, double y) posA, double widthA, double hei
 
 static bool Overlaps(TrackedObject a, (double x, double y) posA, double? rotA, TrackedObject b, (double x, double y) posB, double? rotB)
 {
-    bool aIsRect = a.Shape == "rect";
-    bool bIsRect = b.Shape == "rect";
+    bool aIsRect = a.Shape == "rectangle";
+    bool bIsRect = b.Shape == "rectangle";
     double rA = rotA ?? 0.0;
     double rB = rotB ?? 0.0;
 
@@ -314,11 +314,11 @@ async Task HandleMessage(string senderId, string json)
                 obj.Shape = root.GetProperty("shape").GetString();
                 obj.Width = root.GetProperty("width").GetDouble();
                 obj.Height = root.GetProperty("height").GetDouble();
-                obj.Layer = root.TryGetProperty("layer", out var lEl) ? lEl.GetInt32() : 0;
+                obj.Layer = root.TryGetProperty("layer", out var lEl) ? (lEl.GetString() ?? "") : "";
                 obj.TriggeredByLayers.Clear();
                 if (root.TryGetProperty("triggeredBy", out var tbEl) && tbEl.ValueKind == JsonValueKind.Array)
                 {
-                    foreach (var v in tbEl.EnumerateArray()) obj.TriggeredByLayers.Add(v.GetInt32());
+                    foreach (var v in tbEl.EnumerateArray()) obj.TriggeredByLayers.Add(v.GetString() ?? "");
                 }
                 // Relay-only bookkeeping — no broadcast needed, clients don't need to know about hitbox registration.
                 break;
@@ -634,10 +634,10 @@ class TrackedObject
 
     // Hitbox — Shape is null until RegisterHitbox has been called for this
     // object, meaning it's excluded from hit detection until opted in.
-    public string? Shape; // "rect" or "ellipse"
+    public string? Shape; // "rectangle" or "ellipse"
     public double Width, Height;
-    public int Layer;
-    public HashSet<int> TriggeredByLayers = new HashSet<int>();
+    public string Layer = "";
+    public HashSet<string> TriggeredByLayers = new HashSet<string>();
 
     public (double x, double y) PositionAt(long nowMs)
     {
