@@ -43,51 +43,107 @@ var nextPlayerNum = 0;
 // declaration, so TrackedObject has to live after app.Run(), not here.)
 
 // ─── OVERLAP MATH ───────────────────────────────────────────────────────────
-// Rect-rect is exact (standard AABB test). Anything touching an ellipse is
-// an approximation, not exact geometry — true ellipse-ellipse intersection
-// requires solving a system of equations, which is real complexity for
-// marginal gain in a hit-detection check. Circles (equal width/height) come
-// out exact under this approximation, since it reduces to plain
-// distance-vs-combined-radius in that case. Worth knowing if a game leans
-// hard on tightly-fitted ellipse hitboxes — this won't be pixel-perfect
-// there.
+// Rect-rect uses the Separating Axis Theorem (SAT), which is exact for
+// convex shapes like rectangles regardless of rotation — checking each
+// rect's two edge-normal axes and confirming no axis fully separates them.
+// Ellipse-involving checks remain approximations (true rotated-ellipse
+// intersection is a quartic equation, real complexity for marginal gain
+// here) but now account for rotation by working in each shape's own local,
+// unrotated frame rather than assuming world-axis alignment. Circles
+// (equal width/height) are unaffected by rotation and remain exact.
+// rotA/rotB are in degrees, 0 meaning axis-aligned (unrotated).
 
-static bool Overlaps(TrackedObject a, (double x, double y) posA, TrackedObject b, (double x, double y) posB)
+static (double x, double y) RotateVector(double x, double y, double degrees)
+{
+    double rad = degrees * Math.PI / 180.0;
+    double cos = Math.Cos(rad), sin = Math.Sin(rad);
+    return (x * cos - y * sin, x * sin + y * cos);
+}
+
+// Projects a rect's 4 corners onto an axis and returns [min, max].
+static (double min, double max) ProjectRect((double x, double y) center, double width, double height, double rotDeg, (double x, double y) axis)
+{
+    double hw = width / 2.0, hh = height / 2.0;
+    (double x, double y)[] localCorners = { (-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh) };
+    double min = double.MaxValue, max = double.MinValue;
+    foreach (var c in localCorners)
+    {
+        var (rx, ry) = RotateVector(c.x, c.y, rotDeg);
+        double wx = center.x + rx, wy = center.y + ry;
+        double proj = wx * axis.x + wy * axis.y;
+        if (proj < min) min = proj;
+        if (proj > max) max = proj;
+    }
+    return (min, max);
+}
+
+static bool RectsOverlapSAT((double x, double y) posA, double widthA, double heightA, double rotA, (double x, double y) posB, double widthB, double heightB, double rotB)
+{
+    // Each rect contributes two candidate separating axes: its own local
+    // X and Y edge normals, rotated into world space. Only 4 total axes
+    // need checking for two rectangles (parallel axes between the two
+    // rects would give the same result, so testing one rect's own two is
+    // sufficient per rect).
+    var axes = new (double x, double y)[]
+    {
+        RotateVector(1, 0, rotA), RotateVector(0, 1, rotA),
+        RotateVector(1, 0, rotB), RotateVector(0, 1, rotB),
+    };
+    foreach (var axis in axes)
+    {
+        var (minA, maxA) = ProjectRect(posA, widthA, heightA, rotA, axis);
+        var (minB, maxB) = ProjectRect(posB, widthB, heightB, rotB, axis);
+        if (maxA < minB || maxB < minA) return false; // this axis separates them — no overlap possible
+    }
+    return true; // no separating axis found on any of the 4 candidates — they overlap
+}
+
+static bool Overlaps(TrackedObject a, (double x, double y) posA, double? rotA, TrackedObject b, (double x, double y) posB, double? rotB)
 {
     bool aIsRect = a.Shape == "rect";
     bool bIsRect = b.Shape == "rect";
+    double rA = rotA ?? 0.0;
+    double rB = rotB ?? 0.0;
 
     if (aIsRect && bIsRect)
     {
-        return Math.Abs(posA.x - posB.x) * 2 < (a.Width + b.Width)
-            && Math.Abs(posA.y - posB.y) * 2 < (a.Height + b.Height);
+        return RectsOverlapSAT(posA, a.Width, a.Height, rA, posB, b.Width, b.Height, rB);
     }
 
     if (!aIsRect && !bIsRect)
     {
-        // Ellipse-ellipse approximation: scale the offset by the combined
-        // per-axis radii and check against a unit circle.
+        // Ellipse-ellipse approximation: work in A's local (unrotated)
+        // frame — rotate the offset to B by -rA so A's axes align with
+        // world X/Y, then also rotate B's own axes by (rB - rA) relative
+        // to that frame. Reduces to the original unrotated formula when
+        // both rotations are 0.
         double rx = (a.Width + b.Width) / 2.0;
         double ry = (a.Height + b.Height) / 2.0;
         if (rx <= 0 || ry <= 0) return false;
-        double nx = (posA.x - posB.x) / rx;
-        double ny = (posA.y - posB.y) / ry;
+        var (offX, offY) = RotateVector(posB.x - posA.x, posB.y - posA.y, -rA);
+        double nx = offX / rx;
+        double ny = offY / ry;
         return (nx * nx + ny * ny) < 1.0;
     }
 
-    // One rect, one ellipse: closest-point-on-rect-to-ellipse-center approximation.
+    // One rect, one ellipse: rotate the ellipse's center into the rect's
+    // own local (unrotated) frame, run the same closest-point approximation
+    // as before in that frame, then the result is rotation-invariant since
+    // distance is preserved by rotation.
     var rect = aIsRect ? a : b;
     var rectPos = aIsRect ? posA : posB;
+    double rectRot = aIsRect ? rA : rB;
     var ell = aIsRect ? b : a;
     var ellPos = aIsRect ? posB : posA;
 
-    double closestX = Math.Clamp(ellPos.x, rectPos.x - rect.Width / 2, rectPos.x + rect.Width / 2);
-    double closestY = Math.Clamp(ellPos.y, rectPos.y - rect.Height / 2, rectPos.y + rect.Height / 2);
+    var (localEllX, localEllY) = RotateVector(ellPos.x - rectPos.x, ellPos.y - rectPos.y, -rectRot);
+    double closestX = Math.Clamp(localEllX, -rect.Width / 2, rect.Width / 2);
+    double closestY = Math.Clamp(localEllY, -rect.Height / 2, rect.Height / 2);
     double erx = ell.Width / 2.0;
     double ery = ell.Height / 2.0;
     if (erx <= 0 || ery <= 0) return false;
-    double dnx = (closestX - ellPos.x) / erx;
-    double dny = (closestY - ellPos.y) / ery;
+    double dnx = (closestX - localEllX) / erx;
+    double dny = (closestY - localEllY) / ery;
     return (dnx * dnx + dny * dny) < 1.0;
 }
 
@@ -108,24 +164,28 @@ const int SWEEP_SAMPLES = 8; // number of sub-steps checked between lastTickMs a
 
 static bool OverlapsSwept(TrackedObject a, TrackedObject b, long lastTickMs, long now)
 {
-    // Explicit, not incidental: only a predicted object's position is
-    // resampled across the sweep — its formula gives a genuine
-    // intermediate position at each sampleMs. A synced object's position
-    // is fixed at whatever it last reported, so it's evaluated once at
-    // `now` and held constant for every sample, rather than calling
-    // PositionAt(sampleMs) on it and relying on that returning the same
-    // thing every time. If PositionAt for synced objects ever changes to
-    // interpolate, this still won't accidentally start sweeping a synced
-    // object's segment.
+    // Explicit, not incidental: only a predicted object's position/rotation
+    // is resampled across the sweep — its formula gives a genuine
+    // intermediate value at each sampleMs. A synced object's position and
+    // rotation are fixed at whatever it last reported, so each is
+    // evaluated once at `now` and held constant for every sample, rather
+    // than calling PositionAt/RotationAt(sampleMs) on it and relying on
+    // that returning the same thing every time. If those ever change to
+    // interpolate for synced objects, this still won't accidentally start
+    // sweeping a synced object's segment.
     var fixedPosA = a.IsPredicted ? default : a.PositionAt(now);
     var fixedPosB = b.IsPredicted ? default : b.PositionAt(now);
+    var fixedRotA = a.IsPredicted ? null : a.RotationAt(now);
+    var fixedRotB = b.IsPredicted ? null : b.RotationAt(now);
 
     for (int s = 0; s <= SWEEP_SAMPLES; s++)
     {
         long sampleMs = lastTickMs + (now - lastTickMs) * s / SWEEP_SAMPLES;
         var posA = a.IsPredicted ? a.PositionAt(sampleMs) : fixedPosA;
         var posB = b.IsPredicted ? b.PositionAt(sampleMs) : fixedPosB;
-        if (Overlaps(a, posA, b, posB)) return true;
+        var rotA = a.IsPredicted ? a.RotationAt(sampleMs) : fixedRotA;
+        var rotB = b.IsPredicted ? b.RotationAt(sampleMs) : fixedRotB;
+        if (Overlaps(a, posA, rotA, b, posB, rotB)) return true;
     }
     return false;
 }
@@ -240,6 +300,7 @@ async Task HandleMessage(string senderId, string json)
                     StartVy = root.GetProperty("vy").GetDouble(),
                     Gravity = root.TryGetProperty("gravity", out var gEl) ? gEl.GetDouble() : 0,
                     FireTimeMs = root.TryGetProperty("firedAt", out var fEl) ? fEl.GetInt64() : DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    RotateWithVelocity = root.TryGetProperty("rotateWithVelocity", out var rwvEl) && rwvEl.GetBoolean(),
                 };
                 objects[id] = obj;
                 await BroadcastExcept(senderId, RawPassthrough(senderId, root));
@@ -370,7 +431,7 @@ async Task HitDetectionLoop()
                 bool useSwept = lastTickMs.HasValue && (a.IsPredicted || b.IsPredicted);
                 bool overlapping = useSwept
                     ? OverlapsSwept(a, b, lastTickMs!.Value, now)
-                    : Overlaps(a, a.PositionAt(now), b, b.PositionAt(now));
+                    : Overlaps(a, a.PositionAt(now), a.RotationAt(now), b, b.PositionAt(now), b.RotationAt(now));
 
                 string pairKey = string.CompareOrdinal(a.Id, b.Id) < 0 ? $"{a.Id}|{b.Id}" : $"{b.Id}|{a.Id}";
                 bool wasOverlapping = overlapState.TryGetValue(pairKey, out var prev) && prev;
@@ -492,7 +553,8 @@ app.Map("/", async context =>
             {
                 type = "spawnPredicted", id = obj.Id, typeName = obj.TypeName,
                 x = obj.StartX, y = obj.StartY, vx = obj.StartVx, vy = obj.StartVy,
-                gravity = obj.Gravity, firedAt = obj.FireTimeMs, from = obj.OwnerId
+                gravity = obj.Gravity, firedAt = obj.FireTimeMs, from = obj.OwnerId,
+                rotateWithVelocity = obj.RotateWithVelocity
             });
         }
         else
@@ -568,6 +630,7 @@ class TrackedObject
     // anyone asks, using elapsed time since FireTimeMs.
     public double StartX, StartY, StartVx, StartVy, Gravity;
     public long FireTimeMs;
+    public bool RotateWithVelocity; // predicted objects only — see RotationAt
 
     // Hitbox — Shape is null until RegisterHitbox has been called for this
     // object, meaning it's excluded from hit detection until opted in.
@@ -583,5 +646,23 @@ class TrackedObject
         double x = StartX + StartVx * t;
         double y = StartY + StartVy * t + 0.5 * Gravity * t * t;
         return (x, y);
+    }
+
+    // Current facing in degrees, or null if this object has no rotation
+    // to speak of (a synced object with Rotation unset, or a predicted
+    // object not using RotateWithVelocity, or momentarily zero velocity).
+    // For predicted objects, mirrors the client's instantaneous-velocity
+    // formula exactly — vy changes over time under gravity, so this
+    // curves along the real trajectory rather than freezing at launch
+    // angle, matching what every client independently computes and draws.
+    public double? RotationAt(long nowMs)
+    {
+        if (!IsPredicted) return Rotation;
+        if (!RotateWithVelocity) return null;
+        double t = (nowMs - FireTimeMs) / 1000.0;
+        double instantVx = StartVx;
+        double instantVy = StartVy + Gravity * t;
+        if (instantVx == 0.0 && instantVy == 0.0) return null;
+        return Math.Atan2(instantVy, instantVx) * (180.0 / Math.PI);
     }
 }
