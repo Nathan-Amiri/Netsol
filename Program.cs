@@ -402,7 +402,11 @@ async Task HandleMessage(string senderId, string json)
             case "hitbox":
             {
                 string id = root.GetProperty("id").GetString() ?? "";
-                if (!objects.TryGetValue(id, out var obj)) return; // object must exist first (sync or predict comes before hitbox registration)
+                if (!objects.TryGetValue(id, out var obj))
+                {
+                    Console.WriteLine($"[RELAY][HITBOX-REG-FAIL] id={id} not found in objects dictionary — registration DROPPED. Current objects: [{string.Join(",", objects.Keys)}]");
+                    return;
+                }
                 obj.Shape = root.GetProperty("shape").GetString();
                 obj.Width = root.GetProperty("width").GetDouble();
                 obj.Height = root.GetProperty("height").GetDouble();
@@ -412,6 +416,7 @@ async Task HandleMessage(string senderId, string json)
                 {
                     foreach (var v in tbEl.EnumerateArray()) obj.TriggeredByLayers.Add(v.GetString() ?? "");
                 }
+                Console.WriteLine($"[RELAY][HITBOX-REG-OK] id={id} shape={obj.Shape} w={obj.Width} h={obj.Height} layer={obj.Layer} triggeredBy=[{string.Join(",", obj.TriggeredByLayers)}]");
                 // Relay-only bookkeeping — no broadcast needed, clients don't need to know about hitbox registration.
                 break;
             }
@@ -554,6 +559,7 @@ async Task HitDetectionLoop()
         try
         {
             var withHitboxes = objects.Values.Where(o => o.Shape != null).ToList();
+            Console.WriteLine($"[RELAY][TICK] now={now} withHitboxesCount={withHitboxes.Count} ids=[{string.Join(",", withHitboxes.Select(o => $"{o.Id}:{o.Layer}"))}]");
 
             for (int i = 0; i < withHitboxes.Count; i++)
             {
@@ -562,7 +568,11 @@ async Task HitDetectionLoop()
                     var a = withHitboxes[i];
                     var b = withHitboxes[j];
                     bool relevant = a.TriggeredByLayers.Contains(b.Layer) || b.TriggeredByLayers.Contains(a.Layer);
-                    if (!relevant) continue;
+                    if (!relevant)
+                    {
+                        Console.WriteLine($"[RELAY][PAIR] {a.Id}(layer={a.Layer},triggeredBy=[{string.Join(",", a.TriggeredByLayers)}]) vs {b.Id}(layer={b.Layer},triggeredBy=[{string.Join(",", b.TriggeredByLayers)}]) — NOT RELEVANT, skipped");
+                        continue;
+                    }
 
                     // Swept only when at least one side is a predicted object
                     // (see the comment on OverlapsSwept for why synced objects
@@ -576,6 +586,10 @@ async Task HitDetectionLoop()
                     string pairKey = string.CompareOrdinal(a.Id, b.Id) < 0 ? $"{a.Id}|{b.Id}" : $"{b.Id}|{a.Id}";
                     bool wasOverlapping = overlapState.TryGetValue(pairKey, out var prev) && prev;
 
+                    var posA = a.PositionAt(now);
+                    var posB = b.PositionAt(now);
+                    Console.WriteLine($"[RELAY][PAIR] {a.Id} vs {b.Id} — RELEVANT, useSwept={useSwept} posA=({posA.x:F2},{posA.y:F2}) posB=({posB.x:F2},{posB.y:F2}) dims=({a.Width:F2}x{a.Height:F2})/({b.Width:F2}x{b.Height:F2}) overlapping={overlapping} wasOverlapping={wasOverlapping}");
+
                     if (overlapping != wasOverlapping)
                     {
                         // worldLock means no concurrent delete/unregister can
@@ -585,6 +599,7 @@ async Task HitDetectionLoop()
                         // under this decision between here and the broadcast
                         // below.
                         overlapState[pairKey] = overlapping;
+                        Console.WriteLine($"[RELAY][OVERLAP-SEND] {a.Id} vs {b.Id} state={(overlapping ? "enter" : "exit")}");
                         await BroadcastAll(new { type = "overlap", a = a.Id, b = b.Id, state = overlapping ? "enter" : "exit" });
                     }
                 }
