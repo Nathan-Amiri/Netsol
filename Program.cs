@@ -21,6 +21,7 @@ using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseUrls("http://0.0.0.0:" + (Environment.GetEnvironmentVariable("PORT") ?? "8080"));
@@ -36,6 +37,48 @@ var objects = new ConcurrentDictionary<string, TrackedObject>();
 // never every tick while two things stay overlapped.
 var overlapState = new ConcurrentDictionary<string, bool>();
 var nextPlayerNum = 0;
+
+// Every connected player gets their own private outgoing mailbox and their
+// own dedicated background sender (see RunOutgoingSender below). Code that
+// decides to send something — hit detection, a deletion, an RPC broadcast,
+// anything — never talks to a socket directly. It drops the message in the
+// target player's mailbox and returns immediately, without waiting to see
+// whether that message has actually reached the network yet. Only that one
+// player's own dedicated sender ever reads from their mailbox and performs
+// the real socket send, at whatever pace that one connection can handle.
+//
+// This is what guarantees a slow or stalled connection can only ever back
+// up its OWN mailbox — it can never delay any other player's messages, and
+// it can never delay the relay's own decision-making (hit detection,
+// deletions, anything), since nothing that makes a decision ever waits on
+// a socket. Replaces the previous per-client send lock entirely: with only
+// one dedicated sender ever touching a given socket, there's no longer any
+// concurrent-access hazard to guard against in the first place.
+var outgoingQueues = new ConcurrentDictionary<string, Channel<byte[]>>();
+
+// Serializes every read-decide-mutate-broadcast sequence that touches
+// `objects`/`overlapState` for hit detection — HitDetectionLoop's own
+// per-tick pass, and the "delete"/"unregisterHitbox" handling (plus
+// CleanupPlayer's per-object cleanup on disconnect), all acquire this
+// before doing any of that work. Without it, HitDetectionLoop runs as a
+// fully independent background task with no inherent ordering relative to
+// a delete arriving concurrently — a tick could observe an object as
+// still genuinely present, decide to broadcast an overlap change for it,
+// and a delete for that same object could be decided moments later on a
+// different task, with no guarantee about which broadcast actually
+// reaches a given client first. This lock removes that ambiguity
+// entirely by ensuring only one of "a tick's decisions" or "an object's
+// removal and its own flushed exit" can be in progress at a time,
+// system-wide.
+//
+// Now that "broadcast" (see EnqueueSend below) only ever writes to an
+// in-memory mailbox and never touches a socket, everything this lock
+// guards is fast, bounded, CPU-only work — no player's connection speed
+// can make another player wait on this lock for any meaningful amount of
+// time. The only thing that can delay one player's processing here is
+// another player's own quick, in-memory bookkeeping, never their network
+// quality.
+var worldLock = new SemaphoreSlim(1, 1);
 
 // ─── OBJECT MODEL ───────────────────────────────────────────────────────────
 // (Declared at the end of the file — a top-level statements file requires
@@ -192,45 +235,94 @@ static bool OverlapsSwept(TrackedObject a, TrackedObject b, long lastTickMs, lon
 
 // ─── MESSAGING HELPERS ──────────────────────────────────────────────────────
 
-async Task SendTo(WebSocket socket, object message)
+// The only thing any decision-making code ever does to send a message:
+// drop the bytes in that one client's mailbox and return. Synchronous and
+// effectively instant (an in-memory queue write) — never touches the
+// network, never waits on anything. If the client's mailbox no longer
+// exists (already disconnected/cleaned up), this silently does nothing;
+// there's nobody left to send to.
+void EnqueueSend(string clientId, byte[] bytes)
 {
-    if (socket.State != WebSocketState.Open) return;
-    var json = JsonSerializer.Serialize(message);
-    var bytes = Encoding.UTF8.GetBytes(json);
+    if (outgoingQueues.TryGetValue(clientId, out var channel))
+    {
+        channel.Writer.TryWrite(bytes);
+    }
+}
+
+// The one and only place that actually calls SendAsync for a given
+// client — started once per connection (see the connection handler
+// below) and runs for that client's entire session, reading its own
+// mailbox and nothing else. Because exactly one task ever sends on a
+// given socket, there's no concurrent-access hazard to guard against —
+// no lock needed. A slow SendAsync here only ever delays the NEXT message
+// in THIS SAME client's own mailbox; it cannot affect any other client's
+// sender, since each one is a fully independent task with its own queue.
+async Task RunOutgoingSender(WebSocket socket, ChannelReader<byte[]> reader)
+{
     try
     {
-        await socket.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
+        await foreach (var bytes in reader.ReadAllAsync())
+        {
+            if (socket.State != WebSocketState.Open) continue; // connection's on its way out — drop and keep draining, cleanup will catch it
+            try
+            {
+                // Bounded, unlike the rest of this file's sends used to
+                // be — a connection stalled badly enough to hit this
+                // timeout is as good as dead anyway, and this is what
+                // keeps this task guaranteed to actually finish in
+                // bounded time when a connection closes (see the
+                // connection handler below, which waits for this task to
+                // end before disposing the socket).
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                await socket.SendAsync(bytes, WebSocketMessageType.Text, true, cts.Token);
+            }
+            catch
+            {
+                // Socket died mid-send, or the send timed out — either
+                // way the receive loop for this client will notice and
+                // clean it up; nothing to do here.
+            }
+        }
     }
     catch
     {
-        // Socket died mid-send — the receive loop for that client will
-        // notice and clean it up; nothing to do here.
+        // Mailbox faulted — nothing further to send for this client.
     }
 }
 
-async Task BroadcastExcept(string excludeId, object message)
+// Signatures are unchanged (still Task-returning, still awaitable at every
+// call site) even though nothing inside these actually waits on real
+// network I/O anymore — every call site below can keep its existing
+// `await`, and that await now completes essentially instantly.
+
+Task SendTo(string clientId, object message)
+{
+    var json = JsonSerializer.Serialize(message);
+    EnqueueSend(clientId, Encoding.UTF8.GetBytes(json));
+    return Task.CompletedTask;
+}
+
+Task BroadcastExcept(string excludeId, object message)
 {
     var json = JsonSerializer.Serialize(message);
     var bytes = Encoding.UTF8.GetBytes(json);
-    foreach (var (id, socket) in clients)
+    foreach (var id in clients.Keys)
     {
         if (id == excludeId) continue;
-        if (socket.State != WebSocketState.Open) continue;
-        try { await socket.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None); }
-        catch { /* dead socket, receive loop will clean it up */ }
+        EnqueueSend(id, bytes);
     }
+    return Task.CompletedTask;
 }
 
-async Task BroadcastAll(object message)
+Task BroadcastAll(object message)
 {
     var json = JsonSerializer.Serialize(message);
     var bytes = Encoding.UTF8.GetBytes(json);
-    foreach (var (_, socket) in clients)
+    foreach (var id in clients.Keys)
     {
-        if (socket.State != WebSocketState.Open) continue;
-        try { await socket.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None); }
-        catch { /* dead socket, receive loop will clean it up */ }
+        EnqueueSend(id, bytes);
     }
+    return Task.CompletedTask;
 }
 
 // ─── MESSAGE HANDLING ───────────────────────────────────────────────────────
@@ -331,35 +423,61 @@ async Task HandleMessage(string senderId, string json)
                 // this object stops taking part in hit detection without
                 // removing the TrackedObject itself (it may still be a
                 // perfectly live synced/predicted object, just opting out
-                // of hit detection specifically). Any pair state involving
-                // this id is stale now, so it's cleared too — otherwise a
-                // later re-registration under the same id could read a
-                // leftover "was overlapping" flag from before the gap and
-                // skip firing a real enter/exit.
+                // of hit detection specifically). Flushed first so anyone
+                // still overlapping this hitbox gets a real exit rather
+                // than the pair state just silently disappearing.
+                // worldLock ensures this whole sequence can't interleave
+                // with a concurrently-running HitDetectionLoop tick.
                 string id = root.GetProperty("id").GetString() ?? "";
-                if (objects.TryGetValue(id, out var obj))
+                await worldLock.WaitAsync();
+                try
                 {
-                    obj.Shape = null;
+                    await FlushOverlapsForId(id);
+                    if (objects.TryGetValue(id, out var obj))
+                    {
+                        obj.Shape = null;
+                    }
                 }
-                foreach (var key in overlapState.Keys.Where(k => k.StartsWith(id + "|") || k.EndsWith("|" + id)).ToList())
+                finally
                 {
-                    overlapState.TryRemove(key, out _);
+                    worldLock.Release();
                 }
-                // Relay-only bookkeeping — no broadcast needed, clients
-                // don't need to know about hitbox unregistration itself
-                // (they'll simply stop receiving overlap events for it).
+                // Relay-only bookkeeping otherwise — no broadcast needed,
+                // clients don't need to know about hitbox unregistration
+                // itself (they'll simply stop receiving overlap events for it).
                 break;
             }
 
             case "delete":
             {
+                // Flushed first, same reasoning as unregisterHitbox — any
+                // pair still overlapping this object gets a real exit
+                // before the object itself disappears, rather than the
+                // state just vanishing with no notification. worldLock
+                // ensures this whole sequence can't interleave with a
+                // concurrently-running HitDetectionLoop tick.
+                //
+                // Broadcasts to EVERYONE, including the sender — the
+                // sender does not delete/destroy anything locally when it
+                // calls DeleteSpawnedObject; it only sends this request
+                // and waits for this exact broadcast to come back before
+                // actually removing anything, the same as every other
+                // client. That's what keeps every client's view of when
+                // an object disappears in sync with each other, deleter
+                // included, rather than the deleter seeing it vanish
+                // instantly while everyone else catches up moments later.
                 string id = root.GetProperty("id").GetString() ?? "";
-                objects.TryRemove(id, out _);
-                foreach (var key in overlapState.Keys.Where(k => k.StartsWith(id + "|") || k.EndsWith("|" + id)).ToList())
+                await worldLock.WaitAsync();
+                try
                 {
-                    overlapState.TryRemove(key, out _);
+                    await FlushOverlapsForId(id);
+                    objects.TryRemove(id, out _);
                 }
-                await BroadcastExcept(senderId, RawPassthrough(senderId, root));
+                finally
+                {
+                    worldLock.Release();
+                }
+                await BroadcastAll(RawPassthrough(senderId, root));
                 break;
             }
 
@@ -399,6 +517,24 @@ object RawPassthrough(string senderId, JsonElement root)
     return dict;
 }
 
+// Call before an id stops taking part in hit detection (deleted,
+// unregistered, or its owner disconnecting) — broadcasts a real "exit" for
+// any pair currently overlapping this id, then clears that pair's state.
+// Without this, a mid-overlap removal was previously silent: the pair's
+// state got wiped with no notification at all, so the surviving object's
+// own script never heard the overlap ended, not even as a null.
+async Task FlushOverlapsForId(string id)
+{
+    foreach (var key in overlapState.Keys.Where(k => k.StartsWith(id + "|") || k.EndsWith("|" + id)).ToList())
+    {
+        bool wasOverlapping = overlapState.TryGetValue(key, out var v) && v;
+        overlapState.TryRemove(key, out _);
+        if (!wasOverlapping) continue; // never actually entered — nothing to exit
+        var parts = key.Split('|');
+        await BroadcastAll(new { type = "overlap", a = parts[0], b = parts[1], state = "exit" });
+    }
+}
+
 // ─── HIT DETECTION TICK ─────────────────────────────────────────────────────
 // Runs on its own clock, independent of incoming messages — a predicted
 // object moves purely from time passing, so a message-triggered check alone
@@ -413,35 +549,50 @@ async Task HitDetectionLoop()
     {
         await Task.Delay(TICK_MS);
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        var withHitboxes = objects.Values.Where(o => o.Shape != null).ToList();
 
-        for (int i = 0; i < withHitboxes.Count; i++)
+        await worldLock.WaitAsync();
+        try
         {
-            for (int j = i + 1; j < withHitboxes.Count; j++)
+            var withHitboxes = objects.Values.Where(o => o.Shape != null).ToList();
+
+            for (int i = 0; i < withHitboxes.Count; i++)
             {
-                var a = withHitboxes[i];
-                var b = withHitboxes[j];
-                bool relevant = a.TriggeredByLayers.Contains(b.Layer) || b.TriggeredByLayers.Contains(a.Layer);
-                if (!relevant) continue;
-
-                // Swept only when at least one side is a predicted object
-                // (see the comment on OverlapsSwept for why synced objects
-                // are deliberately excluded) and only once a previous tick
-                // exists to sweep from.
-                bool useSwept = lastTickMs.HasValue && (a.IsPredicted || b.IsPredicted);
-                bool overlapping = useSwept
-                    ? OverlapsSwept(a, b, lastTickMs!.Value, now)
-                    : Overlaps(a, a.PositionAt(now), a.RotationAt(now), b, b.PositionAt(now), b.RotationAt(now));
-
-                string pairKey = string.CompareOrdinal(a.Id, b.Id) < 0 ? $"{a.Id}|{b.Id}" : $"{b.Id}|{a.Id}";
-                bool wasOverlapping = overlapState.TryGetValue(pairKey, out var prev) && prev;
-
-                if (overlapping != wasOverlapping)
+                for (int j = i + 1; j < withHitboxes.Count; j++)
                 {
-                    overlapState[pairKey] = overlapping;
-                    await BroadcastAll(new { type = "overlap", a = a.Id, b = b.Id, state = overlapping ? "enter" : "exit" });
+                    var a = withHitboxes[i];
+                    var b = withHitboxes[j];
+                    bool relevant = a.TriggeredByLayers.Contains(b.Layer) || b.TriggeredByLayers.Contains(a.Layer);
+                    if (!relevant) continue;
+
+                    // Swept only when at least one side is a predicted object
+                    // (see the comment on OverlapsSwept for why synced objects
+                    // are deliberately excluded) and only once a previous tick
+                    // exists to sweep from.
+                    bool useSwept = lastTickMs.HasValue && (a.IsPredicted || b.IsPredicted);
+                    bool overlapping = useSwept
+                        ? OverlapsSwept(a, b, lastTickMs!.Value, now)
+                        : Overlaps(a, a.PositionAt(now), a.RotationAt(now), b, b.PositionAt(now), b.RotationAt(now));
+
+                    string pairKey = string.CompareOrdinal(a.Id, b.Id) < 0 ? $"{a.Id}|{b.Id}" : $"{b.Id}|{a.Id}";
+                    bool wasOverlapping = overlapState.TryGetValue(pairKey, out var prev) && prev;
+
+                    if (overlapping != wasOverlapping)
+                    {
+                        // worldLock means no concurrent delete/unregister can
+                        // be running while this executes, so a/b are
+                        // guaranteed genuinely current for the whole of this
+                        // block — no other task can remove them out from
+                        // under this decision between here and the broadcast
+                        // below.
+                        overlapState[pairKey] = overlapping;
+                        await BroadcastAll(new { type = "overlap", a = a.Id, b = b.Id, state = overlapping ? "enter" : "exit" });
+                    }
                 }
             }
+        }
+        finally
+        {
+            worldLock.Release();
         }
         lastTickMs = now;
     }
@@ -456,10 +607,28 @@ async Task CleanupPlayer(string playerId)
 {
     if (!clients.TryRemove(playerId, out _)) return;
     lastSeen.TryRemove(playerId, out _);
+    // Completing the channel writer lets RunOutgoingSender's read loop for
+    // this player end on its own once anything already queued has drained
+    // (or immediately, if empty) — no need to forcibly cancel it.
+    if (outgoingQueues.TryRemove(playerId, out var channel)) channel.Writer.Complete();
     var owned = objects.Values.Where(o => o.OwnerId == playerId).Select(o => o.Id).ToList();
     foreach (var id in owned)
     {
-        objects.TryRemove(id, out _);
+        // Same flush-before-remove as the explicit "delete" case, under
+        // the same worldLock — a player disconnecting mid-overlap
+        // shouldn't leave the other side of that overlap without a real
+        // exit notification either, and this can't be allowed to
+        // interleave with a concurrently-running HitDetectionLoop tick.
+        await worldLock.WaitAsync();
+        try
+        {
+            await FlushOverlapsForId(id);
+            objects.TryRemove(id, out _);
+        }
+        finally
+        {
+            worldLock.Release();
+        }
         await BroadcastExcept(playerId, new { type = "delete", id, from = playerId });
     }
     // No separate "player left" notification needed — a player's own
@@ -535,8 +704,17 @@ app.Map("/", async context =>
     string playerId = playerNum.ToString();
     clients[playerId] = socket;
     lastSeen[playerId] = DateTimeOffset.UtcNow;
+
+    // This player's own private mailbox and dedicated sender — see the
+    // comments on outgoingQueues/RunOutgoingSender above. Created before
+    // anything is sent so there's always somewhere for early messages
+    // (the "assigned" reply, catch-up spawns) to land.
+    var outgoingChannel = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+    outgoingQueues[playerId] = outgoingChannel;
+    var senderTask = Task.Run(() => RunOutgoingSender(socket, outgoingChannel.Reader));
+
     Console.WriteLine($"[RELAY] {playerId} connected. Total clients: {clients.Count}");
-    await SendTo(socket, new { type = "assigned", id = playerNum }); // sent as a real number, not a quoted string — this is what makes LocalPlayerId a genuine int client-side
+    await SendTo(playerId, new { type = "assigned", id = playerNum }); // sent as a real number, not a quoted string — this is what makes LocalPlayerId a genuine int client-side
 
     // Catch the newcomer up on everything that already exists by replaying
     // each object's spawn message directly — same shape as a live spawn,
@@ -549,7 +727,7 @@ app.Map("/", async context =>
     {
         if (obj.IsPredicted)
         {
-            await SendTo(socket, new
+            await SendTo(playerId, new
             {
                 type = "spawnPredicted", id = obj.Id, typeName = obj.TypeName,
                 x = obj.StartX, y = obj.StartY, vx = obj.StartVx, vy = obj.StartVy,
@@ -561,7 +739,7 @@ app.Map("/", async context =>
         {
             if (obj.Rotation.HasValue)
             {
-                await SendTo(socket, new
+                await SendTo(playerId, new
                 {
                     type = "spawnSynced", id = obj.Id, typeName = obj.TypeName,
                     rot = obj.Rotation.Value, x = obj.X, y = obj.Y, from = obj.OwnerId
@@ -569,7 +747,7 @@ app.Map("/", async context =>
             }
             else
             {
-                await SendTo(socket, new
+                await SendTo(playerId, new
                 {
                     type = "spawnSynced", id = obj.Id, typeName = obj.TypeName,
                     x = obj.X, y = obj.Y, from = obj.OwnerId
@@ -597,7 +775,8 @@ app.Map("/", async context =>
     }
     finally
     {
-        await CleanupPlayer(playerId);
+        await CleanupPlayer(playerId); // completes this client's outgoing channel
+        await senderTask; // wait for RunOutgoingSender to actually finish (bounded by its own 10s send timeout) before this method returns and disposes the socket
     }
 });
 
