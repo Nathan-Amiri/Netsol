@@ -550,6 +550,7 @@ const int TICK_MS = 33; // ~30Hz
 async Task HitDetectionLoop()
 {
     long? lastTickMs = null; // null on the very first tick — nothing to sweep from yet, so that tick falls back to a discrete check
+    long lastTickSnapshotLogMs = 0; // throttles the [TICK] snapshot log to once a second
     while (true)
     {
         await Task.Delay(TICK_MS);
@@ -559,7 +560,14 @@ async Task HitDetectionLoop()
         try
         {
             var withHitboxes = objects.Values.Where(o => o.Shape != null).ToList();
-            Console.WriteLine($"[RELAY][TICK] now={now} withHitboxesCount={withHitboxes.Count} ids=[{string.Join(",", withHitboxes.Select(o => $"{o.Id}:{o.Layer}"))}]");
+            // Throttled to once a second — the full snapshot every tick
+            // (30/sec) was enough log volume on its own to make a hosting
+            // dashboard look like it wasn't updating in real time.
+            if (now - lastTickSnapshotLogMs > 1000)
+            {
+                lastTickSnapshotLogMs = now;
+                Console.WriteLine($"[RELAY][TICK] now={now} withHitboxesCount={withHitboxes.Count} ids=[{string.Join(",", withHitboxes.Select(o => $"{o.Id}:{o.Layer}"))}]");
+            }
 
             for (int i = 0; i < withHitboxes.Count; i++)
             {
@@ -568,11 +576,7 @@ async Task HitDetectionLoop()
                     var a = withHitboxes[i];
                     var b = withHitboxes[j];
                     bool relevant = a.TriggeredByLayers.Contains(b.Layer) || b.TriggeredByLayers.Contains(a.Layer);
-                    if (!relevant)
-                    {
-                        Console.WriteLine($"[RELAY][PAIR] {a.Id}(layer={a.Layer},triggeredBy=[{string.Join(",", a.TriggeredByLayers)}]) vs {b.Id}(layer={b.Layer},triggeredBy=[{string.Join(",", b.TriggeredByLayers)}]) — NOT RELEVANT, skipped");
-                        continue;
-                    }
+                    if (!relevant) continue; // not logged at all now — pure noise once layer matching is confirmed working
 
                     // Swept only when at least one side is a predicted object
                     // (see the comment on OverlapsSwept for why synced objects
@@ -588,7 +592,17 @@ async Task HitDetectionLoop()
 
                     var posA = a.PositionAt(now);
                     var posB = b.PositionAt(now);
-                    Console.WriteLine($"[RELAY][PAIR] {a.Id} vs {b.Id} — RELEVANT, useSwept={useSwept} posA=({posA.x:F2},{posA.y:F2}) posB=({posB.x:F2},{posB.y:F2}) dims=({a.Width:F2}x{a.Height:F2})/({b.Width:F2}x{b.Height:F2}) overlapping={overlapping} wasOverlapping={wasOverlapping}");
+                    // Only logged when the pair is close enough that a hit
+                    // is actually plausible (rough combined-radius check,
+                    // times 3 for margin) — otherwise every relevant pair
+                    // logs every tick even when 40+ units apart, drowning
+                    // out the moments that actually matter.
+                    double dist = Math.Sqrt(Math.Pow(posA.x - posB.x, 2) + Math.Pow(posA.y - posB.y, 2));
+                    double proximityThreshold = (Math.Max(a.Width, a.Height) + Math.Max(b.Width, b.Height)) * 3.0;
+                    if (dist <= proximityThreshold)
+                    {
+                        Console.WriteLine($"[RELAY][PAIR-CLOSE] {a.Id} vs {b.Id} — useSwept={useSwept} posA=({posA.x:F2},{posA.y:F2}) posB=({posB.x:F2},{posB.y:F2}) dist={dist:F2} dims=({a.Width:F2}x{a.Height:F2})/({b.Width:F2}x{b.Height:F2}) overlapping={overlapping} wasOverlapping={wasOverlapping}");
+                    }
 
                     if (overlapping != wasOverlapping)
                     {
