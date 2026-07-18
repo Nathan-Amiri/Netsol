@@ -576,7 +576,7 @@ async Task HitDetectionLoop()
                     var a = withHitboxes[i];
                     var b = withHitboxes[j];
                     bool relevant = a.TriggeredByLayers.Contains(b.Layer) || b.TriggeredByLayers.Contains(a.Layer);
-                    if (!relevant) continue; // not logged at all now — pure noise once layer matching is confirmed working
+                    if (!relevant) continue;
 
                     // Swept only when at least one side is a predicted object
                     // (see the comment on OverlapsSwept for why synced objects
@@ -592,17 +592,12 @@ async Task HitDetectionLoop()
 
                     var posA = a.PositionAt(now);
                     var posB = b.PositionAt(now);
-                    // Only logged when the pair is close enough that a hit
-                    // is actually plausible (rough combined-radius check,
-                    // times 3 for margin) — otherwise every relevant pair
-                    // logs every tick even when 40+ units apart, drowning
-                    // out the moments that actually matter.
+                    // TEMPORARILY unfiltered again — logs every relevant
+                    // pair every tick, not just "close" ones, since the
+                    // proximity filter may itself be hiding the real
+                    // signal rather than just cutting noise.
                     double dist = Math.Sqrt(Math.Pow(posA.x - posB.x, 2) + Math.Pow(posA.y - posB.y, 2));
-                    double proximityThreshold = (Math.Max(a.Width, a.Height) + Math.Max(b.Width, b.Height)) * 3.0;
-                    if (dist <= proximityThreshold)
-                    {
-                        Console.WriteLine($"[RELAY][PAIR-CLOSE] {a.Id} vs {b.Id} — useSwept={useSwept} posA=({posA.x:F2},{posA.y:F2}) posB=({posB.x:F2},{posB.y:F2}) dist={dist:F2} dims=({a.Width:F2}x{a.Height:F2})/({b.Width:F2}x{b.Height:F2}) overlapping={overlapping} wasOverlapping={wasOverlapping}");
-                    }
+                    Console.WriteLine($"[RELAY][PAIR] {a.Id}(rect={a.Shape=="rectangle"},w={a.Width:F2},h={a.Height:F2}) vs {b.Id}(rect={b.Shape=="rectangle"},w={b.Width:F2},h={b.Height:F2}) — useSwept={useSwept} posA=({posA.x:F2},{posA.y:F2}) posB=({posB.x:F2},{posB.y:F2}) dist={dist:F2} overlapping={overlapping} wasOverlapping={wasOverlapping}");
 
                     if (overlapping != wasOverlapping)
                     {
@@ -618,6 +613,17 @@ async Task HitDetectionLoop()
                     }
                 }
             }
+        }
+        catch (Exception ex)
+        {
+            // Previously nothing caught exceptions here at all — an
+            // unhandled exception on any tick would silently kill this
+            // ENTIRE background loop permanently, with zero error output
+            // anywhere, and hit detection would just stop forever from
+            // that point on. Logging it now instead of letting that
+            // happen silently. The loop itself continues on the next
+            // iteration rather than dying, unlike before.
+            Console.WriteLine($"[RELAY][TICK-EXCEPTION] {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
         }
         finally
         {
@@ -683,37 +689,48 @@ async Task HeartbeatLoop()
     while (true)
     {
         await Task.Delay(HEARTBEAT_INTERVAL_MS);
-        await BroadcastAll(new { type = "ping" });
-
-        var now = DateTimeOffset.UtcNow;
-        foreach (var id in clients.Keys)
+        try
         {
-            // No lastSeen entry yet means they only just connected —
-            // not stale, nothing to do.
-            if (lastSeen.TryGetValue(id, out var seen) && (now - seen).TotalMilliseconds > HEARTBEAT_TIMEOUT_MS)
-            {
-                Console.WriteLine($"[RELAY] {id} timed out (no message in {HEARTBEAT_TIMEOUT_MS}ms) — forcing disconnect");
+            await BroadcastAll(new { type = "ping" });
 
-                // Cleanup and notification happen here directly, immediately
-                // — not left to the connection handler's own catch/finally
-                // noticing eventually. That matters because Abort() below
-                // isn't guaranteed to unstick a pending read right away: if
-                // the underlying TCP connection is "half-open" (this
-                // player's side is gone but the OS hasn't noticed yet — a
-                // severed network path rather than a cleanly closed one),
-                // a documented .NET issue means the stuck read can persist
-                // for minutes even after Abort() runs. Calling CleanupPlayer
-                // directly means the 25-second timeout is a real bound
-                // regardless of that. CleanupPlayer is safe to call here
-                // even though the connection handler's own finally block
-                // will *also* eventually call it once its read does
-                // unstick — the second call is a no-op, not a duplicate.
-                if (clients.TryGetValue(id, out var deadSocket))
+            var now = DateTimeOffset.UtcNow;
+            foreach (var id in clients.Keys)
+            {
+                // No lastSeen entry yet means they only just connected —
+                // not stale, nothing to do.
+                if (lastSeen.TryGetValue(id, out var seen) && (now - seen).TotalMilliseconds > HEARTBEAT_TIMEOUT_MS)
                 {
-                    deadSocket.Abort(); // best-effort attempt to actually free the OS-level resources; not depended on for correctness
+                    Console.WriteLine($"[RELAY] {id} timed out (no message in {HEARTBEAT_TIMEOUT_MS}ms) — forcing disconnect");
+
+                    // Cleanup and notification happen here directly, immediately
+                    // — not left to the connection handler's own catch/finally
+                    // noticing eventually. That matters because Abort() below
+                    // isn't guaranteed to unstick a pending read right away: if
+                    // the underlying TCP connection is "half-open" (this
+                    // player's side is gone but the OS hasn't noticed yet — a
+                    // severed network path rather than a cleanly closed one),
+                    // a documented .NET issue means the stuck read can persist
+                    // for minutes even after Abort() runs. Calling CleanupPlayer
+                    // directly means the 25-second timeout is a real bound
+                    // regardless of that. CleanupPlayer is safe to call here
+                    // even though the connection handler's own finally block
+                    // will *also* eventually call it once its read does
+                    // unstick — the second call is a no-op, not a duplicate.
+                    if (clients.TryGetValue(id, out var deadSocket))
+                    {
+                        deadSocket.Abort(); // best-effort attempt to actually free the OS-level resources; not depended on for correctness
+                    }
+                    await CleanupPlayer(id);
                 }
-                await CleanupPlayer(id);
             }
+        }
+        catch (Exception ex)
+        {
+            // Same reasoning as HitDetectionLoop's catch — without this,
+            // any unhandled exception here would silently kill the entire
+            // heartbeat system permanently (no more timeouts detected,
+            // ever), with zero error output anywhere.
+            Console.WriteLine($"[RELAY][HEARTBEAT-EXCEPTION] {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
         }
     }
 }
