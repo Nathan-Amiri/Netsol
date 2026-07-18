@@ -392,6 +392,26 @@ async Task HandleMessage(string senderId, string json)
                     StartVy = root.GetProperty("vy").GetDouble(),
                     Gravity = root.TryGetProperty("gravity", out var gEl) ? gEl.GetDouble() : 0,
                     FireTimeMs = root.TryGetProperty("firedAt", out var fEl) ? fEl.GetInt64() : DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    // The relay's OWN clock reading at the moment it
+                    // receives this message — used as the t=0 reference
+                    // for the relay's own internal PositionAt/RotationAt
+                    // math (hit detection, late-join catch-up), entirely
+                    // separate from FireTimeMs. FireTimeMs is the
+                    // SHOOTER's own clock reading; comparing it directly
+                    // against the relay's clock (a different physical
+                    // machine, with no guaranteed agreement) silently
+                    // corrupted every predicted object's internal
+                    // position by however much those two clocks actually
+                    // disagreed — potentially seconds, not milliseconds.
+                    // RelayReceivedAtMs never gets compared against
+                    // anything but the relay's own later clock readings,
+                    // so there's no cross-machine comparison left in this
+                    // math at all. FireTimeMs itself is untouched and
+                    // still relayed verbatim to other already-connected
+                    // clients, who need the true original shooter
+                    // timestamp for their own peer-to-peer clock-offset
+                    // correction — a separate, already-correct system.
+                    RelayReceivedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                     RotateWithVelocity = root.TryGetProperty("rotateWithVelocity", out var rwvEl) && rwvEl.GetBoolean(),
                 };
                 objects[id] = obj;
@@ -792,7 +812,7 @@ app.Map("/", async context =>
             // MAX_PASSED_TIME_SEC was actually designed to bound.
             long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var currentPos = obj.PositionAt(nowMs);
-            double elapsedSec = (nowMs - obj.FireTimeMs) / 1000.0;
+            double elapsedSec = (nowMs - obj.RelayReceivedAtMs) / 1000.0;
             double currentVx = obj.StartVx;
             double currentVy = obj.StartVy + obj.Gravity * elapsedSec;
 
@@ -875,9 +895,13 @@ class TrackedObject
 
     // Predicted fields — meaningful when IsPredicted is true. Position is
     // never stored directly; it's computed fresh from these every time
-    // anyone asks, using elapsed time since FireTimeMs.
+    // anyone asks, using elapsed time since RelayReceivedAtMs — see the
+    // comment where this is set, in the spawnPredicted handler, for why
+    // that's a different value from FireTimeMs and why that distinction
+    // matters.
     public double StartX, StartY, StartVx, StartVy, Gravity;
     public long FireTimeMs;
+    public long RelayReceivedAtMs;
     public bool RotateWithVelocity; // predicted objects only — see RotationAt
 
     // Hitbox — Shape is null until RegisterHitbox has been called for this
@@ -890,7 +914,7 @@ class TrackedObject
     public (double x, double y) PositionAt(long nowMs)
     {
         if (!IsPredicted) return (X, Y);
-        double t = (nowMs - FireTimeMs) / 1000.0;
+        double t = (nowMs - RelayReceivedAtMs) / 1000.0;
         double x = StartX + StartVx * t;
         double y = StartY + StartVy * t + 0.5 * Gravity * t * t;
         return (x, y);
@@ -907,7 +931,7 @@ class TrackedObject
     {
         if (!IsPredicted) return Rotation;
         if (!RotateWithVelocity) return null;
-        double t = (nowMs - FireTimeMs) / 1000.0;
+        double t = (nowMs - RelayReceivedAtMs) / 1000.0;
         double instantVx = StartVx;
         double instantVy = StartVy + Gravity * t;
         if (instantVx == 0.0 && instantVy == 0.0) return null;
