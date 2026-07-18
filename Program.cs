@@ -742,11 +742,34 @@ app.Map("/", async context =>
     {
         if (obj.IsPredicted)
         {
+            // Send the object's TRUE current state, not its original
+            // launch data — a projectile that's been flying for seconds
+            // needs to appear wherever it actually is right now, not
+            // replay its entire flight from the original spawn point for
+            // a client that's only just joining. Re-parameterizing a
+            // constant-gravity trajectory at any intermediate point using
+            // its exact position and true instantaneous velocity at that
+            // point produces a future path mathematically identical to
+            // the original — this isn't an approximation, verified by
+            // hand: x(T) = x0 + vx*T and y(T) = y0 + vy0*T + 0.5*g*T²
+            // both reduce algebraically to the same formula whether
+            // evaluated from T=0 or restarted at any T0 with the
+            // instantaneous position/velocity at T0 as the new origin.
+            // firedAt = now means the only catch-up this client owes is
+            // the tiny transit time of this one replay message, not the
+            // object's entire real flight duration — which is what
+            // MAX_PASSED_TIME_SEC was actually designed to bound.
+            long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var currentPos = obj.PositionAt(nowMs);
+            double elapsedSec = (nowMs - obj.FireTimeMs) / 1000.0;
+            double currentVx = obj.StartVx;
+            double currentVy = obj.StartVy + obj.Gravity * elapsedSec;
+
             await SendTo(playerId, new
             {
                 type = "spawnPredicted", id = obj.Id, typeName = obj.TypeName,
-                x = obj.StartX, y = obj.StartY, vx = obj.StartVx, vy = obj.StartVy,
-                gravity = obj.Gravity, firedAt = obj.FireTimeMs, from = obj.OwnerId,
+                x = currentPos.x, y = currentPos.y, vx = currentVx, vy = currentVy,
+                gravity = obj.Gravity, firedAt = nowMs, from = obj.OwnerId,
                 rotateWithVelocity = obj.RotateWithVelocity
             });
         }
