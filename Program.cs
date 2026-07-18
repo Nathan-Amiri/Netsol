@@ -422,11 +422,7 @@ async Task HandleMessage(string senderId, string json)
             case "hitbox":
             {
                 string id = root.GetProperty("id").GetString() ?? "";
-                if (!objects.TryGetValue(id, out var obj))
-                {
-                    Console.WriteLine($"[RELAY][HITBOX-REG-FAIL] id={id} not found in objects dictionary — registration DROPPED. Current objects: [{string.Join(",", objects.Keys)}]");
-                    return;
-                }
+                if (!objects.TryGetValue(id, out var obj)) return;
                 obj.Shape = root.GetProperty("shape").GetString();
                 obj.Width = root.GetProperty("width").GetDouble();
                 obj.Height = root.GetProperty("height").GetDouble();
@@ -436,7 +432,6 @@ async Task HandleMessage(string senderId, string json)
                 {
                     foreach (var v in tbEl.EnumerateArray()) obj.TriggeredByLayers.Add(v.GetString() ?? "");
                 }
-                Console.WriteLine($"[RELAY][HITBOX-REG-OK] id={id} shape={obj.Shape} w={obj.Width} h={obj.Height} layer={obj.Layer} triggeredBy=[{string.Join(",", obj.TriggeredByLayers)}]");
                 // Relay-only bookkeeping — no broadcast needed, clients don't need to know about hitbox registration.
                 break;
             }
@@ -570,7 +565,6 @@ const int TICK_MS = 33; // ~30Hz
 async Task HitDetectionLoop()
 {
     long? lastTickMs = null; // null on the very first tick — nothing to sweep from yet, so that tick falls back to a discrete check
-    long lastTickSnapshotLogMs = 0; // throttles the [TICK] snapshot log to once a second
     while (true)
     {
         await Task.Delay(TICK_MS);
@@ -580,14 +574,6 @@ async Task HitDetectionLoop()
         try
         {
             var withHitboxes = objects.Values.Where(o => o.Shape != null).ToList();
-            // Throttled to once a second — the full snapshot every tick
-            // (30/sec) was enough log volume on its own to make a hosting
-            // dashboard look like it wasn't updating in real time.
-            if (now - lastTickSnapshotLogMs > 1000)
-            {
-                lastTickSnapshotLogMs = now;
-                Console.WriteLine($"[RELAY][TICK] now={now} withHitboxesCount={withHitboxes.Count} ids=[{string.Join(",", withHitboxes.Select(o => $"{o.Id}:{o.Layer}"))}]");
-            }
 
             for (int i = 0; i < withHitboxes.Count; i++)
             {
@@ -610,15 +596,6 @@ async Task HitDetectionLoop()
                     string pairKey = string.CompareOrdinal(a.Id, b.Id) < 0 ? $"{a.Id}|{b.Id}" : $"{b.Id}|{a.Id}";
                     bool wasOverlapping = overlapState.TryGetValue(pairKey, out var prev) && prev;
 
-                    var posA = a.PositionAt(now);
-                    var posB = b.PositionAt(now);
-                    // TEMPORARILY unfiltered again — logs every relevant
-                    // pair every tick, not just "close" ones, since the
-                    // proximity filter may itself be hiding the real
-                    // signal rather than just cutting noise.
-                    double dist = Math.Sqrt(Math.Pow(posA.x - posB.x, 2) + Math.Pow(posA.y - posB.y, 2));
-                    Console.WriteLine($"[RELAY][PAIR] {a.Id}(rect={a.Shape=="rectangle"},w={a.Width:F2},h={a.Height:F2}) vs {b.Id}(rect={b.Shape=="rectangle"},w={b.Width:F2},h={b.Height:F2}) — useSwept={useSwept} posA=({posA.x:F2},{posA.y:F2}) posB=({posB.x:F2},{posB.y:F2}) dist={dist:F2} overlapping={overlapping} wasOverlapping={wasOverlapping}");
-
                     if (overlapping != wasOverlapping)
                     {
                         // worldLock means no concurrent delete/unregister can
@@ -628,7 +605,6 @@ async Task HitDetectionLoop()
                         // under this decision between here and the broadcast
                         // below.
                         overlapState[pairKey] = overlapping;
-                        Console.WriteLine($"[RELAY][OVERLAP-SEND] {a.Id} vs {b.Id} state={(overlapping ? "enter" : "exit")}");
                         await BroadcastAll(new { type = "overlap", a = a.Id, b = b.Id, state = overlapping ? "enter" : "exit" });
                     }
                 }
