@@ -45,7 +45,7 @@ var nextPlayerNum = 0;
 // target player's mailbox and returns immediately, without waiting to see
 // whether that message has actually reached the network yet. Only that one
 // player's own dedicated sender ever reads from their mailbox and performs
-// the real socket send, at whatever pace that one connection can handle.
+// the socket send, at whatever pace that one connection can handle.
 //
 // This is what guarantees a slow or stalled connection can only ever back
 // up its OWN mailbox — it can never delay any other player's messages, and
@@ -63,7 +63,7 @@ var outgoingQueues = new ConcurrentDictionary<string, Channel<byte[]>>();
 // before doing any of that work. Without it, HitDetectionLoop runs as a
 // fully independent background task with no inherent ordering relative to
 // a delete arriving concurrently — a tick could observe an object as
-// still genuinely present, decide to broadcast an overlap change for it,
+// still present, decide to broadcast an overlap change for it,
 // and a delete for that same object could be decided moments later on a
 // different task, with no guarantee about which broadcast actually
 // reaches a given client first. This lock removes that ambiguity
@@ -90,7 +90,7 @@ var worldLock = new SemaphoreSlim(1, 1);
 // convex shapes like rectangles regardless of rotation — checking each
 // rect's two edge-normal axes and confirming no axis fully separates them.
 // Ellipse-involving checks remain approximations (true rotated-ellipse
-// intersection is a quartic equation, real complexity for marginal gain
+// intersection is a quartic equation, complexity for marginal gain
 // here) but now account for rotation by working in each shape's own local,
 // unrotated frame rather than assuming world-axis alignment. Circles
 // (equal width/height) are unaffected by rotation and remain exact.
@@ -195,11 +195,11 @@ static bool Overlaps(TrackedObject a, (double x, double y) posA, double? rotA, T
 // one side of a target at tick N and past it at tick N+1, with no tick ever
 // landing inside the hitbox. Only applied when at least one side is a
 // predicted object, since a predicted object's position is a pure formula —
-// PositionAt can be evaluated at any real intermediate timestamp, giving a
+// PositionAt can be evaluated at any intermediate timestamp, giving a
 // true sample of the object's actual path rather than a guess. This is
 // deliberately NOT applied to synced-vs-synced pairs (two players): a synced
 // object's position is whatever the owning client last reported, so a large
-// tick-over-tick jump could be a genuine lag spike rather than real motion —
+// tick-over-tick jump could be a lag spike rather than motion —
 // sweeping that segment risks registering a hit along a path the object
 // never actually traveled. Discrete per-tick checking has no such risk,
 // since it only ever asks "is it overlapping right now."
@@ -208,7 +208,7 @@ const int SWEEP_SAMPLES = 8; // number of sub-steps checked between lastTickMs a
 static bool OverlapsSwept(TrackedObject a, TrackedObject b, long lastTickMs, long now)
 {
     // Explicit, not incidental: only a predicted object's position/rotation
-    // is resampled across the sweep — its formula gives a genuine
+    // is resampled across the sweep — its formula gives an
     // intermediate value at each sampleMs. A synced object's position and
     // rotation are fixed at whatever it last reported, so each is
     // evaluated once at `now` and held constant for every sample, rather
@@ -291,7 +291,7 @@ async Task RunOutgoingSender(WebSocket socket, ChannelReader<byte[]> reader)
 }
 
 // Signatures are unchanged (still Task-returning, still awaitable at every
-// call site) even though nothing inside these actually waits on real
+// call site) even though nothing inside these actually waits on
 // network I/O anymore — every call site below can keep its existing
 // `await`, and that await now completes essentially instantly.
 
@@ -444,7 +444,7 @@ async Task HandleMessage(string senderId, string json)
                 // removing the TrackedObject itself (it may still be a
                 // perfectly live synced/predicted object, just opting out
                 // of hit detection specifically). Flushed first so anyone
-                // still overlapping this hitbox gets a real exit rather
+                // still overlapping this hitbox gets an exit rather
                 // than the pair state just silently disappearing.
                 // worldLock ensures this whole sequence can't interleave
                 // with a concurrently-running HitDetectionLoop tick.
@@ -471,7 +471,7 @@ async Task HandleMessage(string senderId, string json)
             case "delete":
             {
                 // Flushed first, same reasoning as unregisterHitbox — any
-                // pair still overlapping this object gets a real exit
+                // pair still overlapping this object gets an exit
                 // before the object itself disappears, rather than the
                 // state just vanishing with no notification. worldLock
                 // ensures this whole sequence can't interleave with a
@@ -538,7 +538,7 @@ object RawPassthrough(string senderId, JsonElement root)
 }
 
 // Call before an id stops taking part in hit detection (deleted,
-// unregistered, or its owner disconnecting) — broadcasts a real "exit" for
+// unregistered, or its owner disconnecting) — broadcasts an "exit" for
 // any pair currently overlapping this id, then clears that pair's state.
 // Without this, a mid-overlap removal was previously silent: the pair's
 // state got wiped with no notification at all, so the surviving object's
@@ -600,7 +600,7 @@ async Task HitDetectionLoop()
                     {
                         // worldLock means no concurrent delete/unregister can
                         // be running while this executes, so a/b are
-                        // guaranteed genuinely current for the whole of this
+                        // guaranteed current for the whole of this
                         // block — no other task can remove them out from
                         // under this decision between here and the broadcast
                         // below.
@@ -647,7 +647,7 @@ async Task CleanupPlayer(string playerId)
     {
         // Same flush-before-remove as the explicit "delete" case, under
         // the same worldLock — a player disconnecting mid-overlap
-        // shouldn't leave the other side of that overlap without a real
+        // shouldn't leave the other side of that overlap without a
         // exit notification either, and this can't be allowed to
         // interleave with a concurrently-running HitDetectionLoop tick.
         await worldLock.WaitAsync();
@@ -707,7 +707,7 @@ async Task HeartbeatLoop()
                     // severed network path rather than a cleanly closed one),
                     // a documented .NET issue means the stuck read can persist
                     // for minutes even after Abort() runs. Calling CleanupPlayer
-                    // directly means the 25-second timeout is a real bound
+                    // directly means the 25-second timeout is a bound
                     // regardless of that. CleanupPlayer is safe to call here
                     // even though the connection handler's own finally block
                     // will *also* eventually call it once its read does
@@ -756,7 +756,7 @@ app.Map("/", async context =>
     var senderTask = Task.Run(() => RunOutgoingSender(socket, outgoingChannel.Reader));
 
     Console.WriteLine($"[RELAY] {playerId} connected. Total clients: {clients.Count}");
-    await SendTo(playerId, new { type = "assigned", id = playerNum }); // sent as a real number, not a quoted string — this is what makes LocalPlayerId a genuine int client-side
+    await SendTo(playerId, new { type = "assigned", id = playerNum });
 
     // Catch the newcomer up on everything that already exists by replaying
     // each object's spawn message directly — same shape as a live spawn,
@@ -784,7 +784,7 @@ app.Map("/", async context =>
             // instantaneous position/velocity at T0 as the new origin.
             // firedAt = now means the only catch-up this client owes is
             // the tiny transit time of this one replay message, not the
-            // object's entire real flight duration — which is what
+            // object's entire flight duration — which is what
             // MAX_PASSED_TIME_SEC was actually designed to bound.
             long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var currentPos = obj.PositionAt(nowMs);
@@ -901,7 +901,7 @@ class TrackedObject
     // object not using RotateWithVelocity, or momentarily zero velocity).
     // For predicted objects, mirrors the client's instantaneous-velocity
     // formula exactly — vy changes over time under gravity, so this
-    // curves along the real trajectory rather than freezing at launch
+    // curves along the trajectory rather than freezing at launch
     // angle, matching what every client independently computes and draws.
     public double? RotationAt(long nowMs)
     {
