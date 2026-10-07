@@ -45,7 +45,7 @@ var nextPlayerNum = 0;
 // target player's mailbox and returns immediately, without waiting to see
 // whether that message has actually reached the network yet. Only that one
 // player's own dedicated sender ever reads from their mailbox and performs
-// the socket send, at whatever pace that one connection can handle.
+// the real socket send, at whatever pace that one connection can handle.
 //
 // This is what guarantees a slow or stalled connection can only ever back
 // up its OWN mailbox — it can never delay any other player's messages, and
@@ -63,7 +63,7 @@ var outgoingQueues = new ConcurrentDictionary<string, Channel<byte[]>>();
 // before doing any of that work. Without it, HitDetectionLoop runs as a
 // fully independent background task with no inherent ordering relative to
 // a delete arriving concurrently — a tick could observe an object as
-// still present, decide to broadcast an overlap change for it,
+// still genuinely present, decide to broadcast an overlap change for it,
 // and a delete for that same object could be decided moments later on a
 // different task, with no guarantee about which broadcast actually
 // reaches a given client first. This lock removes that ambiguity
@@ -80,6 +80,16 @@ var outgoingQueues = new ConcurrentDictionary<string, Channel<byte[]>>();
 // quality.
 var worldLock = new SemaphoreSlim(1, 1);
 
+// Relay-clock time at which the most recent hit-detection tick finished
+// its sweep window — null until the first tick has run. Read and written
+// only while holding worldLock. HitDetectionLoop sweeps predicted objects
+// from this to "now" each tick; a hitbox's final check on removal uses it
+// as the earliest point it may sweep from, since everything before it was
+// already covered by a tick. Without that bound, a long-lived projectile's
+// removal would sweep its whole flight against where synced players stand
+// at removal time, producing hits on players who weren't there yet.
+long? lastTickMs = null;
+
 // ─── OBJECT MODEL ───────────────────────────────────────────────────────────
 // (Declared at the end of the file — a top-level statements file requires
 // every plain executable statement to come before any class/struct
@@ -90,7 +100,7 @@ var worldLock = new SemaphoreSlim(1, 1);
 // convex shapes like rectangles regardless of rotation — checking each
 // rect's two edge-normal axes and confirming no axis fully separates them.
 // Ellipse-involving checks remain approximations (true rotated-ellipse
-// intersection is a quartic equation, complexity for marginal gain
+// intersection is a quartic equation, real complexity for marginal gain
 // here) but now account for rotation by working in each shape's own local,
 // unrotated frame rather than assuming world-axis alignment. Circles
 // (equal width/height) are unaffected by rotation and remain exact.
@@ -195,11 +205,11 @@ static bool Overlaps(TrackedObject a, (double x, double y) posA, double? rotA, T
 // one side of a target at tick N and past it at tick N+1, with no tick ever
 // landing inside the hitbox. Only applied when at least one side is a
 // predicted object, since a predicted object's position is a pure formula —
-// PositionAt can be evaluated at any intermediate timestamp, giving a
+// PositionAt can be evaluated at any real intermediate timestamp, giving a
 // true sample of the object's actual path rather than a guess. This is
 // deliberately NOT applied to synced-vs-synced pairs (two players): a synced
 // object's position is whatever the owning client last reported, so a large
-// tick-over-tick jump could be a lag spike rather than motion —
+// tick-over-tick jump could be a genuine lag spike rather than real motion —
 // sweeping that segment risks registering a hit along a path the object
 // never actually traveled. Discrete per-tick checking has no such risk,
 // since it only ever asks "is it overlapping right now."
@@ -208,7 +218,7 @@ const int SWEEP_SAMPLES = 8; // number of sub-steps checked between lastTickMs a
 static bool OverlapsSwept(TrackedObject a, TrackedObject b, long lastTickMs, long now)
 {
     // Explicit, not incidental: only a predicted object's position/rotation
-    // is resampled across the sweep — its formula gives an
+    // is resampled across the sweep — its formula gives a genuine
     // intermediate value at each sampleMs. A synced object's position and
     // rotation are fixed at whatever it last reported, so each is
     // evaluated once at `now` and held constant for every sample, rather
@@ -291,7 +301,7 @@ async Task RunOutgoingSender(WebSocket socket, ChannelReader<byte[]> reader)
 }
 
 // Signatures are unchanged (still Task-returning, still awaitable at every
-// call site) even though nothing inside these actually waits on
+// call site) even though nothing inside these actually waits on real
 // network I/O anymore — every call site below can keep its existing
 // `await`, and that await now completes essentially instantly.
 
@@ -422,17 +432,45 @@ async Task HandleMessage(string senderId, string json)
             case "hitbox":
             {
                 string id = root.GetProperty("id").GetString() ?? "";
-                if (!objects.TryGetValue(id, out var obj)) return;
-                obj.Shape = root.GetProperty("shape").GetString();
-                obj.Width = root.GetProperty("width").GetDouble();
-                obj.Height = root.GetProperty("height").GetDouble();
-                obj.Layer = root.TryGetProperty("layer", out var lEl) ? (lEl.GetString() ?? "") : "";
-                obj.TriggeredByLayers.Clear();
-                if (root.TryGetProperty("triggeredBy", out var tbEl) && tbEl.ValueKind == JsonValueKind.Array)
+                // Under worldLock like every other mutation of hit-detection
+                // state: the tick reads Shape/Width/Height/Layer/
+                // TriggeredByLayers under this lock, so writing them
+                // without it risked a tick seeing a half-written hitbox.
+                // It also lets the check below run against a consistent
+                // world.
+                await worldLock.WaitAsync();
+                try
                 {
-                    foreach (var v in tbEl.EnumerateArray()) obj.TriggeredByLayers.Add(v.GetString() ?? "");
+                    if (!objects.TryGetValue(id, out var obj)) return;
+                    long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    bool wasRegistered = obj.Shape != null;
+                    obj.Shape = root.GetProperty("shape").GetString();
+                    obj.Width = root.GetProperty("width").GetDouble();
+                    obj.Height = root.GetProperty("height").GetDouble();
+                    obj.Layer = root.TryGetProperty("layer", out var lEl) ? (lEl.GetString() ?? "") : "";
+                    obj.TriggeredByLayers.Clear();
+                    if (root.TryGetProperty("triggeredBy", out var tbEl) && tbEl.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var v in tbEl.EnumerateArray()) obj.TriggeredByLayers.Add(v.GetString() ?? "");
+                    }
+                    // Re-registering an already-registered hitbox (to
+                    // resize it, say) isn't a new hitbox, so its start
+                    // time stays put.
+                    if (!wasRegistered) obj.HitboxRegisteredAtMs = now;
+
+                    // A first look at the hitbox the moment it exists,
+                    // rather than waiting for the next tick — together
+                    // with FinalCheck on removal, this means a hitbox is
+                    // examined at its start and its end however briefly
+                    // it lives, including one that registers and goes
+                    // away between two ticks.
+                    await EvaluateAgainstAll(obj, null, now);
                 }
-                // Relay-only bookkeeping — no broadcast needed, clients don't need to know about hitbox registration.
+                finally
+                {
+                    worldLock.Release();
+                }
+                // No broadcast of the registration itself — clients don't need to know about hitbox registration.
                 break;
             }
 
@@ -443,19 +481,26 @@ async Task HandleMessage(string senderId, string json)
                 // this object stops taking part in hit detection without
                 // removing the TrackedObject itself (it may still be a
                 // perfectly live synced/predicted object, just opting out
-                // of hit detection specifically). Flushed first so anyone
-                // still overlapping this hitbox gets an exit rather
-                // than the pair state just silently disappearing.
-                // worldLock ensures this whole sequence can't interleave
-                // with a concurrently-running HitDetectionLoop tick.
+                // of hit detection specifically). FinalCheck runs first so
+                // a hitbox that lived between two ticks still gets
+                // examined, then anyone still overlapping it gets a real
+                // exit rather than the pair state just silently
+                // disappearing. worldLock ensures this whole sequence
+                // can't interleave with a concurrently-running
+                // HitDetectionLoop tick.
                 string id = root.GetProperty("id").GetString() ?? "";
                 await worldLock.WaitAsync();
                 try
                 {
-                    await FlushOverlapsForId(id);
                     if (objects.TryGetValue(id, out var obj))
                     {
+                        await FinalCheck(obj);
+                        await FlushOverlapsForId(id);
                         obj.Shape = null;
+                    }
+                    else
+                    {
+                        await FlushOverlapsForId(id);
                     }
                 }
                 finally
@@ -471,7 +516,7 @@ async Task HandleMessage(string senderId, string json)
             case "delete":
             {
                 // Flushed first, same reasoning as unregisterHitbox — any
-                // pair still overlapping this object gets an exit
+                // pair still overlapping this object gets a real exit
                 // before the object itself disappears, rather than the
                 // state just vanishing with no notification. worldLock
                 // ensures this whole sequence can't interleave with a
@@ -490,6 +535,7 @@ async Task HandleMessage(string senderId, string json)
                 await worldLock.WaitAsync();
                 try
                 {
+                    if (objects.TryGetValue(id, out var obj)) await FinalCheck(obj);
                     await FlushOverlapsForId(id);
                     objects.TryRemove(id, out _);
                 }
@@ -538,7 +584,7 @@ object RawPassthrough(string senderId, JsonElement root)
 }
 
 // Call before an id stops taking part in hit detection (deleted,
-// unregistered, or its owner disconnecting) — broadcasts an "exit" for
+// unregistered, or its owner disconnecting) — broadcasts a real "exit" for
 // any pair currently overlapping this id, then clears that pair's state.
 // Without this, a mid-overlap removal was previously silent: the pair's
 // state got wiped with no notification at all, so the surviving object's
@@ -562,53 +608,99 @@ async Task FlushOverlapsForId(string id)
 
 const int TICK_MS = 33; // ~30Hz
 
+// Does this pair overlap at any point in [windowStartMs, now]? A predicted
+// object's side is swept across the window (see OverlapsSwept); with no
+// window, or a zero-length one, it's a plain look at "now".
+static bool PairOverlaps(TrackedObject a, TrackedObject b, long? windowStartMs, long now)
+{
+    bool useSwept = windowStartMs.HasValue && windowStartMs.Value < now && (a.IsPredicted || b.IsPredicted);
+    return useSwept
+        ? OverlapsSwept(a, b, windowStartMs!.Value, now)
+        : Overlaps(a, a.PositionAt(now), a.RotationAt(now), b, b.PositionAt(now), b.RotationAt(now));
+}
+
+// One pair's full evaluation: relevance by layer, overlap over the window,
+// and a broadcast only when the pair's state actually changed. Caller must
+// hold worldLock — that's what guarantees a and b are current, and that no
+// other task is mid-decision about either of them, from here to the
+// broadcast.
+async Task EvaluatePair(TrackedObject a, TrackedObject b, long? windowStartMs, long now)
+{
+    bool relevant = a.TriggeredByLayers.Contains(b.Layer) || b.TriggeredByLayers.Contains(a.Layer);
+    if (!relevant) return;
+
+    bool overlapping = PairOverlaps(a, b, windowStartMs, now);
+
+    string pairKey = string.CompareOrdinal(a.Id, b.Id) < 0 ? $"{a.Id}|{b.Id}" : $"{b.Id}|{a.Id}";
+    bool wasOverlapping = overlapState.TryGetValue(pairKey, out var prev) && prev;
+
+    if (overlapping != wasOverlapping)
+    {
+        overlapState[pairKey] = overlapping;
+        await BroadcastAll(new { type = "overlap", a = a.Id, b = b.Id, state = overlapping ? "enter" : "exit" });
+    }
+}
+
+// Evaluates one object against every other object that currently has a
+// hitbox. Caller must hold worldLock.
+async Task EvaluateAgainstAll(TrackedObject target, long? windowStartMs, long now)
+{
+    foreach (var other in objects.Values)
+    {
+        if (ReferenceEquals(other, target) || other.Shape == null) continue;
+        await EvaluatePair(target, other, windowStartMs, now);
+    }
+}
+
+// The last look at a hitbox before it stops taking part in hit detection
+// (unregistered, deleted, or its owner disconnecting). The tick alone can
+// miss a hitbox that registers and goes away between two ticks, however
+// much it overlapped a target; this guarantees every hitbox is examined at
+// least at its start (see the "hitbox" handler) and at its end.
+//
+// The sweep starts no earlier than the last tick: everything before that
+// was already covered by a tick, and sweeping further back would test a
+// predicted object's whole earlier flight against where synced objects
+// stand right now, reporting hits on players who weren't there yet.
+// Caller must hold worldLock.
+async Task FinalCheck(TrackedObject obj)
+{
+    if (obj.Shape == null) return;
+    long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+    long windowStart = lastTickMs.HasValue ? Math.Max(obj.HitboxRegisteredAtMs, lastTickMs.Value) : obj.HitboxRegisteredAtMs;
+    await EvaluateAgainstAll(obj, windowStart, now);
+}
+
 async Task HitDetectionLoop()
 {
-    long? lastTickMs = null; // null on the very first tick — nothing to sweep from yet, so that tick falls back to a discrete check
     while (true)
     {
         await Task.Delay(TICK_MS);
-        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
         await worldLock.WaitAsync();
         try
         {
+            // Taken after the lock is held, not before waiting for it, so
+            // time never runs backward between this and the hitbox
+            // handlers' own checks, which also read the clock under it.
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
             var withHitboxes = objects.Values.Where(o => o.Shape != null).ToList();
 
             for (int i = 0; i < withHitboxes.Count; i++)
             {
                 for (int j = i + 1; j < withHitboxes.Count; j++)
                 {
-                    var a = withHitboxes[i];
-                    var b = withHitboxes[j];
-                    bool relevant = a.TriggeredByLayers.Contains(b.Layer) || b.TriggeredByLayers.Contains(a.Layer);
-                    if (!relevant) continue;
-
-                    // Swept only when at least one side is a predicted object
-                    // (see the comment on OverlapsSwept for why synced objects
-                    // are deliberately excluded) and only once a previous tick
-                    // exists to sweep from.
-                    bool useSwept = lastTickMs.HasValue && (a.IsPredicted || b.IsPredicted);
-                    bool overlapping = useSwept
-                        ? OverlapsSwept(a, b, lastTickMs!.Value, now)
-                        : Overlaps(a, a.PositionAt(now), a.RotationAt(now), b, b.PositionAt(now), b.RotationAt(now));
-
-                    string pairKey = string.CompareOrdinal(a.Id, b.Id) < 0 ? $"{a.Id}|{b.Id}" : $"{b.Id}|{a.Id}";
-                    bool wasOverlapping = overlapState.TryGetValue(pairKey, out var prev) && prev;
-
-                    if (overlapping != wasOverlapping)
-                    {
-                        // worldLock means no concurrent delete/unregister can
-                        // be running while this executes, so a/b are
-                        // guaranteed current for the whole of this
-                        // block — no other task can remove them out from
-                        // under this decision between here and the broadcast
-                        // below.
-                        overlapState[pairKey] = overlapping;
-                        await BroadcastAll(new { type = "overlap", a = a.Id, b = b.Id, state = overlapping ? "enter" : "exit" });
-                    }
+                    // Swept only for pairs with a predicted object (see the
+                    // comment on OverlapsSwept for why synced objects are
+                    // deliberately excluded), and only once a previous tick
+                    // exists to sweep from — PairOverlaps falls back to a
+                    // plain look when there is no window yet.
+                    await EvaluatePair(withHitboxes[i], withHitboxes[j], lastTickMs, now);
                 }
             }
+
+            lastTickMs = now;
         }
         catch (Exception ex)
         {
@@ -625,7 +717,6 @@ async Task HitDetectionLoop()
         {
             worldLock.Release();
         }
-        lastTickMs = now;
     }
 }
 
@@ -645,14 +736,16 @@ async Task CleanupPlayer(string playerId)
     var owned = objects.Values.Where(o => o.OwnerId == playerId).Select(o => o.Id).ToList();
     foreach (var id in owned)
     {
-        // Same flush-before-remove as the explicit "delete" case, under
-        // the same worldLock — a player disconnecting mid-overlap
-        // shouldn't leave the other side of that overlap without a
-        // exit notification either, and this can't be allowed to
-        // interleave with a concurrently-running HitDetectionLoop tick.
+        // Same final-check-then-flush-then-remove as the explicit "delete"
+        // case, under the same worldLock — a player disconnecting
+        // mid-overlap shouldn't leave the other side of that overlap
+        // without a real exit notification either, and this can't be
+        // allowed to interleave with a concurrently-running
+        // HitDetectionLoop tick.
         await worldLock.WaitAsync();
         try
         {
+            if (objects.TryGetValue(id, out var obj)) await FinalCheck(obj);
             await FlushOverlapsForId(id);
             objects.TryRemove(id, out _);
         }
@@ -707,7 +800,7 @@ async Task HeartbeatLoop()
                     // severed network path rather than a cleanly closed one),
                     // a documented .NET issue means the stuck read can persist
                     // for minutes even after Abort() runs. Calling CleanupPlayer
-                    // directly means the 25-second timeout is a bound
+                    // directly means the 25-second timeout is a real bound
                     // regardless of that. CleanupPlayer is safe to call here
                     // even though the connection handler's own finally block
                     // will *also* eventually call it once its read does
@@ -756,7 +849,7 @@ app.Map("/", async context =>
     var senderTask = Task.Run(() => RunOutgoingSender(socket, outgoingChannel.Reader));
 
     Console.WriteLine($"[RELAY] {playerId} connected. Total clients: {clients.Count}");
-    await SendTo(playerId, new { type = "assigned", id = playerNum });
+    await SendTo(playerId, new { type = "assigned", id = playerNum }); // sent as a real number, not a quoted string — this is what makes LocalPlayerId a genuine int client-side
 
     // Catch the newcomer up on everything that already exists by replaying
     // each object's spawn message directly — same shape as a live spawn,
@@ -784,7 +877,7 @@ app.Map("/", async context =>
             // instantaneous position/velocity at T0 as the new origin.
             // firedAt = now means the only catch-up this client owes is
             // the tiny transit time of this one replay message, not the
-            // object's entire flight duration — which is what
+            // object's entire real flight duration — which is what
             // MAX_PASSED_TIME_SEC was actually designed to bound.
             long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var currentPos = obj.PositionAt(nowMs);
@@ -886,6 +979,11 @@ class TrackedObject
     public double Width, Height;
     public string Layer = "";
     public HashSet<string> TriggeredByLayers = new HashSet<string>();
+    // Relay-clock time the hitbox was last registered from the unregistered
+    // state (re-registering an already-registered hitbox, e.g. to resize
+    // it, leaves this alone). Bounds how far back a removal-time check
+    // may sweep — see FinalCheck.
+    public long HitboxRegisteredAtMs;
 
     public (double x, double y) PositionAt(long nowMs)
     {
@@ -901,7 +999,7 @@ class TrackedObject
     // object not using RotateWithVelocity, or momentarily zero velocity).
     // For predicted objects, mirrors the client's instantaneous-velocity
     // formula exactly — vy changes over time under gravity, so this
-    // curves along the trajectory rather than freezing at launch
+    // curves along the real trajectory rather than freezing at launch
     // angle, matching what every client independently computes and draws.
     public double? RotationAt(long nowMs)
     {
